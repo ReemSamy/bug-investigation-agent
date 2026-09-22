@@ -1,0 +1,3 @@
+﻿<Project>
+  <!-- Standalone agent: packages versioned per project (CPM disabled via Directory.Build.props). -->
+</Project>

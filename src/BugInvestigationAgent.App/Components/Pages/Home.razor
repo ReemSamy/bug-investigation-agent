@@ -1,0 +1,574 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@using BugInvestigationAgent.Core.Context
+@using BugInvestigationAgent.Core.Credentials
+@using BugInvestigationAgent.Core.Memory
+@using BugInvestigationAgent.Core.Orchestration
+@using BugInvestigationAgent.Core.Sessions
+@using BugInvestigationAgent.Core.Workflow
+@inject IAgentSessionStore Sessions
+@inject IAgentOrchestrator Orchestrator
+@inject ICredentialVault CredentialVault
+@inject BugInvestigationAgent.Core.Configuration.IJiraConnectionSettings JiraConnection
+@implements IDisposable
+
+<PageTitle>Workflow — Bug Investigation Agent</PageTitle>
+
+@if (!string.IsNullOrWhiteSpace(_session?.Context.FinalStatusMessage) && _session.State == AgentState.Completed)
+{
+    <div class="banner success"><strong>@_session.Context.FinalStatusMessage</strong></div>
+}
+@if (_session?.State == AgentState.AwaitingMissingInfo)
+{
+    <div class="banner warn">
+        <strong>Action needed</strong>
+        <div>@(_session.Context.MissingInfoReason ?? "Enter the information below, then click Continue.")</div>
+    </div>
+}
+@if (_session?.State is AgentState.Blocked or AgentState.Failed)
+{
+    <div class="banner warn">
+        <strong>@AgentStateDisplay.Label(_session.State)</strong>
+        <div>@(_session.Context.ReproductionNotes ?? _session.LastError ?? "The run stopped. Update credentials below or click Analyze ticket again.")</div>
+    </div>
+}
+@if (!string.IsNullOrWhiteSpace(_session?.LastError) && _session.State is not AgentState.Blocked and not AgentState.Failed)
+{
+    <div class="banner warn"><strong>Error:</strong> @_session.LastError</div>
+}
+
+<div class="grid-2">
+    <section class="panel">
+        <h2>Start investigation</h2>
+        <p class="muted">
+            Enter a Jira ticket. Each Analyze starts a <strong>fresh</strong> investigation for that ticket only.
+        </p>
+
+        @if (_session is not null && !string.IsNullOrWhiteSpace(_session.Context.JiraTicketKey))
+        {
+            <div class="banner success">
+                Investigating ticket <strong>@_session.Context.JiraTicketKey</strong>
+                @if (!string.IsNullOrWhiteSpace(_session.Context.Summary))
+                {
+                    <div class="muted">@_session.Context.Summary</div>
+                }
+            </div>
+        }
+
+        @if (JiraConnection.IsSignedIn)
+        {
+            <div class="banner success">
+                Signed in as <strong>@JiraConnection.SignedInDisplayName</strong> (@JiraConnection.SignedInEmail)
+            </div>
+        }
+        else if (JiraConnection.IsConfigured)
+        {
+            <div class="banner warn">
+                Account saved but not verified.
+                Open <a href="/settings">Sign in / Account</a> and click <strong>Sign in with my account</strong>.
+            </div>
+        }
+        else
+        {
+            <div class="banner warn">
+                <strong>Not signed in.</strong>
+                Open <a href="/settings">Sign in / Account</a> and sign in with your Atlassian email + API token.
+            </div>
+        }
+
+        <div class="field">
+            <label for="jira">Jira ticket ID or URL</label>
+            <input id="jira" @bind="_jiraInput" placeholder="VKMS-4180 or https://…/browse/VKMS-4180" />
+        </div>
+        <div class="btn-row">
+            <button class="btn" disabled="@(_busy || !JiraConnection.IsSignedIn)" @onclick="StartAsync">Analyze ticket</button>
+            <a class="btn secondary" href="/settings">Sign in / Account</a>
+        </div>
+
+        @if (_session is not null)
+        {
+            <h3>Progress</h3>
+            <ul class="pipeline">
+                @foreach (var step in _pipeline)
+                {
+                    var effective = _session.State switch
+                    {
+                        AgentState.ReadyToReproduce or AgentState.ConnectingEnvironment => AgentState.Reproducing,
+                        AgentState.FixProposed => AgentState.AwaitingApproval,
+                        AgentState.Blocked or AgentState.Failed => AgentState.AwaitingMissingInfo,
+                        _ => _session.State
+                    };
+                    var cls = step == effective ? "current" : (IsDone(step, _session.State) ? "done" : "");
+                    <li class="@cls">@AgentStateDisplay.Label(step)</li>
+                }
+            </ul>
+
+            @if ((_session.State == AgentState.AwaitingMissingInfo || _session.State == AgentState.Blocked)
+                 && _session.Context.MissingFields.Count > 0)
+            {
+                <h3>Next step — provide this to continue</h3>
+                <p class="muted">Portal login (not Atlassian). Then click Continue to retry reproduce.</p>
+                @foreach (var field in _session.Context.MissingFields)
+                {
+                    <div class="field">
+                        <label>@field.Label</label>
+                        <div class="muted" style="margin-bottom:0.35rem">@field.Reason</div>
+                        @if (field.Key == "credentials")
+                        {
+                            <div class="field">
+                                <label>Existing profile</label>
+                                <select @bind="_selectedProfileId">
+                                    <option value="">— enter new credentials —</option>
+                                    @foreach (var p in _profiles)
+                                    {
+                                        <option value="@p.Id">@p.Label</option>
+                                    }
+                                </select>
+                            </div>
+                            @if (string.IsNullOrWhiteSpace(_selectedProfileId))
+                            {
+                                <div class="field"><label>Username</label><input @bind="_credUser" autocomplete="username" placeholder="@(_session.Context.Username ?? "application username")" /></div>
+                                <div class="field"><label>Password</label><input type="password" @bind="_credPassword" autocomplete="current-password" /></div>
+                                <div class="field"><label>Token (optional)</label><input type="password" @bind="_credToken" /></div>
+                                <label><input type="checkbox" @bind="_saveProfile" /> Save credential profile for reuse</label>
+                            }
+                        }
+                        else if (field.InputType == "settings-link" || field.Key == "jiraSettings")
+                        {
+                            <a class="btn" href="/settings">Open Sign in / Account</a>
+                        }
+                        else if (field.InputType == "textarea" || field.Key == "ticketText" || field.Key == "reproductionSteps")
+                        {
+                            <textarea @bind="_missingValues[field.Key]" placeholder="Paste steps, one per line…" style="min-height:120px"></textarea>
+                        }
+                        else if (field.IsSecret)
+                        {
+                            <input type="password" @bind="_missingValues[field.Key]" />
+                        }
+                        else if (field.Key == "workspacePath")
+                        {
+                            <input @bind="_missingValues[field.Key]" placeholder="C:\path\to\local\repo" />
+                        }
+                        else if (field.Key == "environmentUrl")
+                        {
+                            <input @bind="_missingValues[field.Key]" placeholder="https://my-env.example.com" />
+                        }
+                        else
+                        {
+                            <input @bind="_missingValues[field.Key]" />
+                        }
+                    </div>
+                }
+                <div class="btn-row">
+                    <button class="btn" @onclick="SubmitMissingAsync">Continue</button>
+                </div>
+            }
+            else if (_session.State == AgentState.AwaitingMissingInfo)
+            {
+                <div class="banner warn">
+                    Waiting for input, but no form fields were generated. Click <strong>Analyze ticket</strong> again.
+                </div>
+            }
+
+            <h3>Extracted context</h3>
+            <dl class="kv">
+                <dt>Ticket</dt><dd>@_session.Context.JiraTicketKey</dd>
+                <dt>Summary</dt><dd>@(_session.Context.Summary ?? "—")</dd>
+                <dt>Fix version</dt><dd>@(_session.Context.FixVersion ?? "—")</dd>
+                <dt>Environment</dt><dd>@(_session.Context.EnvironmentName ?? "—")</dd>
+                <dt>URL</dt><dd>@(_session.Context.EnvironmentUrl ?? "—")</dd>
+                <dt>User / role</dt><dd>@($"{_session.Context.Username ?? "—"} / {_session.Context.Role ?? "—"}")</dd>
+                <dt>Steps</dt><dd>@_session.Context.ReproductionSteps.Count</dd>
+                <dt>Reproduction</dt><dd>@_session.Context.ReproductionOutcome</dd>
+                @if (!string.IsNullOrWhiteSpace(_session.Context.ReproductionNotes))
+                {
+                    <dt>Notes</dt><dd>@_session.Context.ReproductionNotes</dd>
+                }
+            </dl>
+
+            @if (_session.State is AgentState.FixProposed or AgentState.AwaitingApproval)
+            {
+                @if (_session.Context.CustomFields.ContainsKey("investigationBlockedNoLlm"))
+                {
+                    <div class="banner warn">
+                        <strong>No code fix to approve.</strong>
+                        @_session.Context.RootCause
+                    </div>
+                }
+                else
+                {
+                    <h3>Proposed fix</h3>
+                    <p><strong>Bug → Root cause:</strong> @_session.Context.RootCause</p>
+                    <p><strong>Proposed fix:</strong> @_session.Context.ProposedFixSummary</p>
+                    <p><strong>Files:</strong> @string.Join(", ", _session.Context.ProposedFiles)</p>
+                    <div class="diff">@(_session.Context.ProposedDiff ?? "(no unified diff proposed — review summary)")</div>
+                    <div class="btn-row" style="margin-top:0.75rem">
+                        <button class="btn success" @onclick="() => ApproveAsync(true)">Approve & apply</button>
+                        <button class="btn danger" @onclick="() => ApproveAsync(false)">Reject</button>
+                    </div>
+                }
+            }
+
+            @if (!string.IsNullOrWhiteSpace(_session.Context.AppliedDiff))
+            {
+                <h3>Applied changes</h3>
+                <div class="diff">@_session.Context.AppliedDiff</div>
+            }
+
+            @if (_session.Context.ValidationResults.Count > 0)
+            {
+                <h3>Validation</h3>
+                @foreach (var v in _session.Context.ValidationResults)
+                {
+                    <p><strong>@v.Command</strong> — exit @v.ExitCode</p>
+                    <div class="diff">@v.StdOut @v.StdErr</div>
+                }
+            }
+        }
+    </section>
+
+    <aside>
+        <section class="panel">
+            <h3>Activity</h3>
+            <div class="status-log">
+                @if (_session is null)
+                {
+                    <span class="muted">No session yet.</span>
+                }
+                else
+                {
+                    @foreach (var line in _session.Context.StatusLog.Reverse().Take(80).Reverse())
+                    {
+                        <div>@line</div>
+                    }
+                }
+            </div>
+        </section>
+
+        @if (_session?.Context.Evidence.Count > 0)
+        {
+            <section class="panel">
+                <h3>Evidence</h3>
+                @{
+                    var summary = _session.Context.Evidence.LastOrDefault(e => e.Kind == "summary");
+                    var shots = _session.Context.Evidence.Where(e => e.Kind == "screenshot" && !string.IsNullOrWhiteSpace(e.Path)).ToList();
+                }
+                @if (summary is not null)
+                {
+                    <div class="evidence-summary">@summary.Caption</div>
+                }
+                else if (!string.IsNullOrWhiteSpace(_session.Context.ReproductionNotes))
+                {
+                    <div class="evidence-summary">@_session.Context.ReproductionNotes</div>
+                }
+
+                @if (shots.Count == 0)
+                {
+                    <p class="muted">No screenshots were captured for this run.</p>
+                }
+                else
+                {
+                    <div class="banner warn" style="margin-bottom:0.85rem">
+                        <strong>@shots.Count screenshot(s)</strong> were captured for this run.
+                        Many early steps (login / Modules menu) are often not needed after review.
+                        <div class="btn-row" style="margin-top:0.65rem">
+                            <button class="btn secondary" @onclick="KeepAllEvidenceAsync">Keep all screenshots</button>
+                            <button class="btn danger" @onclick="DeleteAllEvidenceAsync">Delete all screenshots from this app</button>
+                        </div>
+                        @if (!string.IsNullOrWhiteSpace(_evidenceActionMessage))
+                        {
+                            <div class="muted" style="margin-top:0.5rem">@_evidenceActionMessage</div>
+                        }
+                    </div>
+                    <div class="evidence-gallery">
+                        @foreach (var e in shots)
+                        {
+                            var url = ToEvidenceUrl(e.Path!);
+                            <figure class="evidence-card">
+                                <figcaption>
+                                    @(FriendlyShotCaption(e.Caption) ?? "Screenshot")
+                                    <button class="btn secondary" style="padding:0.2rem 0.55rem;font-size:0.75rem;margin-left:0.5rem" @onclick="() => DeleteOneEvidenceAsync(e)">Delete</button>
+                                </figcaption>
+                                @if (url is not null)
+                                {
+                                    <a href="@url" target="_blank" rel="noopener">
+                                        <img src="@url" alt="@(e.Caption ?? "evidence screenshot")" class="evidence-img" />
+                                    </a>
+                                }
+                                else
+                                {
+                                    <p class="muted">Screenshot file exists on disk but could not be mapped for display: @e.Path</p>
+                                }
+                            </figure>
+                        }
+                    </div>
+                }
+            </section>
+        }
+
+        @if (_session is not null)
+        {
+            <section class="panel">
+                <h3>Save engineering lesson</h3>
+                <p class="muted">Human-validated only. Never stores credentials.</p>
+                <div class="field">
+                    <label>Lesson</label>
+                    <textarea @bind="_lessonText" placeholder="For routing issues, start with RouteResolver…"></textarea>
+                </div>
+                <div class="field">
+                    <label>Scope</label>
+                    <select @bind="_lessonScope">
+                        @foreach (MemoryScope s in Enum.GetValues<MemoryScope>())
+                        {
+                            <option value="@s">@s</option>
+                        }
+                    </select>
+                </div>
+                <button class="btn secondary" @onclick="SaveLessonAsync">Save as lesson</button>
+            </section>
+        }
+    </aside>
+</div>
+
+@code {
+    private static readonly AgentState[] _pipeline =
+    [
+        AgentState.ReadingJira,
+        AgentState.ExtractingContext,
+        AgentState.AwaitingMissingInfo,
+        AgentState.Reproducing,
+        AgentState.Investigating,
+        AgentState.AwaitingApproval,
+        AgentState.ApplyingFix,
+        AgentState.Validating,
+        AgentState.Retesting,
+        AgentState.Completed
+    ];
+
+    private string _jiraInput = "";
+    private string _workspacePath = "";
+    private bool _busy;
+    private bool _jiraReady;
+    private AgentSession? _session;
+    private Dictionary<string, string> _missingValues = new(StringComparer.OrdinalIgnoreCase);
+    private List<CredentialProfile> _profiles = new();
+    private string _selectedProfileId = "";
+    private string _credUser = "";
+    private string _credPassword = "";
+    private string _credToken = "";
+    private bool _saveProfile = true;
+    private string _lessonText = "";
+    private MemoryScope _lessonScope = MemoryScope.Repository;
+    private string _evidenceActionMessage = "";
+
+    protected override void OnInitialized()
+    {
+        _jiraReady = JiraConnection.IsSignedIn;
+    }
+
+    private async Task StartAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_jiraInput))
+            return;
+
+        _jiraReady = JiraConnection.IsSignedIn;
+        if (!_jiraReady)
+            return;
+
+        _busy = true;
+        try
+        {
+            Detach();
+            _session = Sessions.Create();
+            _session.Changed += OnSessionChanged;
+            _missingValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            await Orchestrator.StartAsync(_session.Id, _jiraInput.Trim(), string.IsNullOrWhiteSpace(_workspacePath) ? null : _workspacePath.Trim());
+            _profiles = (await CredentialVault.ListProfilesAsync()).ToList();
+            if (!string.IsNullOrWhiteSpace(_session.Context.Username))
+                _credUser = _session.Context.Username;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task SubmitMissingAsync()
+    {
+        if (_session is null)
+            return;
+
+        var values = new Dictionary<string, string>(_missingValues, StringComparer.OrdinalIgnoreCase);
+        // Prefer explicit missing-field workspace over the start form when both are set.
+        if (!values.ContainsKey("workspacePath") && !string.IsNullOrWhiteSpace(_workspacePath))
+            values["workspacePath"] = _workspacePath;
+
+        CredentialSecret? secret = null;
+        if (!string.IsNullOrWhiteSpace(_selectedProfileId) && Guid.TryParse(_selectedProfileId, out var profileId))
+        {
+            values["credentialProfileId"] = profileId.ToString();
+        }
+        else if (_session.Context.MissingFields.Any(f => f.Key == "credentials"))
+        {
+            secret = new CredentialSecret
+            {
+                Username = string.IsNullOrWhiteSpace(_credUser) ? (_session.Context.Username ?? "user") : _credUser,
+                Password = _credPassword,
+                Token = string.IsNullOrWhiteSpace(_credToken) ? null : _credToken
+            };
+        }
+
+        await Orchestrator.SubmitMissingInfoAsync(_session.Id, values, secret, _saveProfile);
+        StateHasChanged();
+    }
+
+    private async Task ApproveAsync(bool approve)
+    {
+        if (_session is null) return;
+        await Orchestrator.ApproveFixAsync(_session.Id, approve);
+    }
+
+    private async Task SaveLessonAsync()
+    {
+        if (_session is null || string.IsNullOrWhiteSpace(_lessonText))
+            return;
+        await Orchestrator.SaveLessonAsync(_session.Id, _lessonText, _lessonScope, new[] { "user-correction" }, "user");
+        _lessonText = "";
+    }
+
+    private Task KeepAllEvidenceAsync()
+    {
+        _evidenceActionMessage = "Kept all screenshots for this run.";
+        return Task.CompletedTask;
+    }
+
+    private Task DeleteOneEvidenceAsync(EvidenceItem item)
+    {
+        if (_session is null || string.IsNullOrWhiteSpace(item.Path))
+            return Task.CompletedTask;
+
+        TryDeleteFile(item.Path);
+        _session.Context.Evidence.Remove(item);
+        _evidenceActionMessage = "Deleted 1 screenshot.";
+        _session.NotifyChanged();
+        return Task.CompletedTask;
+    }
+
+    private Task DeleteAllEvidenceAsync()
+    {
+        if (_session is null)
+            return Task.CompletedTask;
+
+        var shots = _session.Context.Evidence
+            .Where(e => e.Kind == "screenshot" && !string.IsNullOrWhiteSpace(e.Path))
+            .ToList();
+        foreach (var shot in shots)
+        {
+            TryDeleteFile(shot.Path!);
+            _session.Context.Evidence.Remove(shot);
+        }
+
+        // Also clear empty session evidence folder when possible.
+        if (shots.Count > 0 && !string.IsNullOrWhiteSpace(shots[0].Path))
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(shots[0].Path);
+                if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+                    Directory.Delete(dir);
+            }
+            catch { /* ignore */ }
+        }
+
+        _evidenceActionMessage = $"Deleted {shots.Count} screenshot(s) from this app.";
+        _session.NotifyChanged();
+        return Task.CompletedTask;
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch { /* ignore locked/missing files */ }
+    }
+
+    private void OnSessionChanged()
+    {
+        if (_session?.Context.MissingFields is { Count: > 0 } fields)
+        {
+            foreach (var f in fields)
+            {
+                if (!_missingValues.ContainsKey(f.Key) && f.Key != "credentials")
+                    _missingValues[f.Key] = "";
+            }
+        }
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void Detach()
+    {
+        if (_session is not null)
+            _session.Changed -= OnSessionChanged;
+    }
+
+    public void Dispose() => Detach();
+
+    private static bool IsDone(AgentState step, AgentState current)
+    {
+        // Map intermediate / terminal states onto the visible pipeline for progress chips.
+        var effective = current switch
+        {
+            AgentState.ReadyToReproduce or AgentState.ConnectingEnvironment => AgentState.Reproducing,
+            AgentState.FixProposed => AgentState.AwaitingApproval,
+            AgentState.Blocked or AgentState.Failed => AgentState.AwaitingMissingInfo,
+            _ => current
+        };
+        return Array.IndexOf(_pipeline, step) < Array.IndexOf(_pipeline, effective)
+               || effective == AgentState.Completed;
+    }
+
+    private static string? ToEvidenceUrl(string absolutePath)
+    {
+        if (string.IsNullOrWhiteSpace(absolutePath))
+            return null;
+
+        var normalized = absolutePath.Replace('\\', '/');
+        var marker = "/App_Data/evidence/";
+        var idx = normalized.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0)
+        {
+            marker = "/evidence/";
+            idx = normalized.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0)
+                return null;
+            var relativeAlt = normalized[(idx + marker.Length)..].Trim('/');
+            var partsAlt = relativeAlt.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            return partsAlt.Length >= 2
+                ? $"/evidence/{Uri.EscapeDataString(partsAlt[0])}/{Uri.EscapeDataString(partsAlt[^1])}"
+                : null;
+        }
+
+        var relative = normalized[(idx + marker.Length)..].Trim('/');
+        var parts = relative.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+            return null;
+
+        return $"/evidence/{Uri.EscapeDataString(parts[0])}/{Uri.EscapeDataString(parts[^1])}";
+    }
+
+    private static string? FriendlyShotCaption(string? caption)
+    {
+        if (string.IsNullOrWhiteSpace(caption))
+            return null;
+        if (caption.Contains("After connect/login", StringComparison.OrdinalIgnoreCase))
+            return "After login / connect — what the agent saw when opening the environment";
+        if (caption.Contains("Open the application", StringComparison.OrdinalIgnoreCase))
+            return "Reproduction attempt — opened the app (generic step; no detailed Jira steps were available)";
+        if (caption.StartsWith("Step ", StringComparison.OrdinalIgnoreCase))
+            return caption;
+        return caption;
+    }
+}

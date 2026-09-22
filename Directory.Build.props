@@ -1,0 +1,6 @@
+﻿<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <DisableKmsAnalyzers>true</DisableKmsAnalyzers>
+  </PropertyGroup>
+</Project>

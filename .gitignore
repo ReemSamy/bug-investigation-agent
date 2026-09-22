@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+App_Data/
+
+**/keys/
+*.user
+*.db
+*.db-shm
+*.db-wal
+.vs/
