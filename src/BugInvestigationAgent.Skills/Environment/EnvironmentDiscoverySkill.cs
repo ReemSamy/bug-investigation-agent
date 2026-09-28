@@ -53,6 +53,14 @@ public sealed class EnvironmentDiscoverySkill : ISkill
         }
 
         ctx.EnvironmentUrl = EnvironmentUrlParser.NormalizeUrl(ctx.EnvironmentUrl);
+        if (!EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(ctx.EnvironmentUrl))
+            ctx.EnvironmentUrl = null;
+
+        // Don't keep tracker hosts as the "environment" label.
+        if (string.Equals(ctx.EnvironmentName, "dev.azure.com", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(ctx.EnvironmentName, "visualstudio.com", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(ctx.EnvironmentName, "atlassian.net", StringComparison.OrdinalIgnoreCase))
+            ctx.EnvironmentName = null;
 
         if (ctx.ReproductionSteps.Count == 0)
             ctx.ReproductionSteps = Jira.JiraSkill.ExtractSteps(ctx.Description);

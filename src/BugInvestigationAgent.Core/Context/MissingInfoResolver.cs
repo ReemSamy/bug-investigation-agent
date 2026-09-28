@@ -65,15 +65,18 @@ public sealed class MissingInfoResolver : IMissingInfoResolver
         }
 
         context.EnvironmentUrl = EnvironmentUrlParser.NormalizeUrl(context.EnvironmentUrl);
-        if (string.IsNullOrWhiteSpace(context.EnvironmentUrl))
+        if (!EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(context.EnvironmentUrl))
         {
-            missing.Add(new MissingField
+            // ADO/PR/Jira links are ticket metadata — never treat them as the portal to open.
+            if (!string.IsNullOrWhiteSpace(context.EnvironmentUrl) ||
+                string.Equals(context.EnvironmentName, "dev.azure.com", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(context.EnvironmentName, "visualstudio.com", StringComparison.OrdinalIgnoreCase))
             {
-                Key = "environmentUrl",
-                Label = "Environment URL",
-                Reason = "Could not find an environment host/URL on the Jira ticket.",
-                InputType = "url"
-            });
+                context.EnvironmentUrl = null;
+                if (string.Equals(context.EnvironmentName, "dev.azure.com", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(context.EnvironmentName, "visualstudio.com", StringComparison.OrdinalIgnoreCase))
+                    context.EnvironmentName = null;
+            }
         }
 
         var needsUserIdentity = string.IsNullOrWhiteSpace(context.Username) && string.IsNullOrWhiteSpace(context.Role);
@@ -93,6 +96,22 @@ public sealed class MissingInfoResolver : IMissingInfoResolver
 
         var needsCredentialsGate = !context.UserConfirmedReadyToReproduce
             || context.CredentialProfileId is null;
+        var needsEnvironmentUrl = !EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(context.EnvironmentUrl);
+
+        // Ask for portal URL when missing/invalid, and also while confirming credentials so the user can override a wrong auto-detect.
+        if (needsEnvironmentUrl || needsCredentialsGate)
+        {
+            missing.Add(new MissingField
+            {
+                Key = "environmentUrl",
+                Label = "Environment URL (portal to test)",
+                Reason = needsEnvironmentUrl
+                    ? "Provide the KMS/portal environment URL to open in the browser (for example https://….azurewebsites.net). " +
+                      "Do not use Azure DevOps, Jira, or pull-request links — those are not the application under test."
+                    : "Confirm this is the application environment the agent should open (not Azure DevOps / Jira / PR links).",
+                InputType = "url"
+            });
+        }
 
         if (needsCredentialsGate)
         {

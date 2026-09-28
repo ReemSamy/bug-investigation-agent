@@ -92,6 +92,17 @@ Edit `Agent:ValidationCommandAllowlist` in `appsettings.json`. Only listed comma
 
 Swap providers via `Agent:ActiveProviderId` without changing Core, Skills, Memory, Credentials, or UI.
 
+## Adaptive investigation (incremental)
+
+Pipeline additions after Jira load:
+
+1. **Ticket understanding** (LLM) → `InvestigationIntent`
+2. **Historical Jira search** (JQL + LLM ranking) → similar issues
+3. **Historical reproduction reuse** (validated only) → optional adopted steps
+4. **KMS docs retrieval** → set `Agent:KmsDocs:RootPath` to a local markdown clone
+
+Browser mode (`Agent:Browser:Mode`): `Deterministic` (default). Adaptive Playwright MCP spike docs: `docs/adaptive-browser-mcp.md`.
+
 ## Security notes
 
 - Passwords/tokens are stored via ASP.NET Data Protection under `App_Data/`.  

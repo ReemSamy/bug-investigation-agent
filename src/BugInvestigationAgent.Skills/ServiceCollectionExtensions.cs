@@ -1,3 +1,5 @@
+using BugInvestigationAgent.Core.Browser;
+using BugInvestigationAgent.Core.Knowledge;
 using BugInvestigationAgent.Core.Skills;
 using BugInvestigationAgent.Skills.Browser;
 using BugInvestigationAgent.Skills.Code;
@@ -6,6 +8,7 @@ using BugInvestigationAgent.Skills.Environment;
 using BugInvestigationAgent.Skills.Evidence;
 using BugInvestigationAgent.Skills.Future;
 using BugInvestigationAgent.Skills.Jira;
+using BugInvestigationAgent.Skills.Knowledge;
 using BugInvestigationAgent.Skills.Reproduction;
 using BugInvestigationAgent.Skills.Validation;
 using Microsoft.Extensions.DependencyInjection;
@@ -20,7 +23,18 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<PlaywrightSessionHub>();
         services.AddSingleton<IPlaywrightSessionHub>(sp => sp.GetRequiredService<PlaywrightSessionHub>());
         services.AddSingleton<BugInvestigationAgent.Core.Browser.IBrowserSessionCloser>(sp => sp.GetRequiredService<PlaywrightSessionHub>());
+
+        services.AddSingleton<IJiraIssueSearchClient, JiraIssueSearchClient>();
+        services.AddSingleton<DeterministicPlaywrightBrowserSurface>();
+        services.AddSingleton<PlaywrightMcpBrowserSurface>();
+        services.AddSingleton<IBrowserToolSurfaceResolver, BrowserToolSurfaceResolver>();
+        services.AddSingleton<IBrowserToolSurface>(sp => sp.GetRequiredService<IBrowserToolSurfaceResolver>().Resolve());
+
         services.AddScoped<ISkill, JiraSkill>();
+        services.AddScoped<ISkill, TicketUnderstandingSkill>();
+        services.AddScoped<ISkill, HistoricalJiraSearchSkill>();
+        services.AddScoped<ISkill, HistoricalReproductionReuseSkill>();
+        services.AddScoped<ISkill, KmsDocumentationSkill>();
         services.AddScoped<ISkill, EnvironmentDiscoverySkill>();
         services.AddScoped<ISkill, CredentialSkill>();
         services.AddScoped<ISkill, BrowserAutomationSkill>();

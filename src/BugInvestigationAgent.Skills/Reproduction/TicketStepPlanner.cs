@@ -35,6 +35,18 @@ public static class TicketStepPlanner
             return fromJira;
         }
 
+        // Phase 2: only use historical steps when explicitly validated against THIS ticket.
+        if (ctx.Investigation.CandidateStepsValidatedAgainstTicket &&
+            ctx.Investigation.AdoptedHistoricalSteps.Count > 0)
+        {
+            var adopted = ExpandAllSteps(ctx.Investigation.AdoptedHistoricalSteps);
+            EnsureObserveStep(adopted, DescribeDefect(ctx.Summary, ctx.Description));
+            ctx.ReproductionSteps = adopted;
+            ctx.CustomFields["stepsFromHistoricalValidated"] = "true";
+            ctx.CustomFields["historicalStepsSource"] = ctx.Investigation.CandidateStepsSourceKey ?? "";
+            return adopted;
+        }
+
         var inferred = InferFromTicket(ctx);
         ctx.ReproductionSteps = inferred.ToList();
         ctx.CustomFields["stepsInferredFromTicket"] = "true";
@@ -54,7 +66,11 @@ public static class TicketStepPlanner
         if (jiraSteps.Count > 0)
         {
             var expanded = ExpandAllSteps(jiraSteps);
-            EnsureObserveStep(expanded, defect);
+            // Incomplete Jira paths (e.g. stop on Persons list) must still drill into the defect UI.
+            if (LooksLikeMultiSelectAssigneeTypingDefect(corpus))
+                EnsureMultiSelectAssigneeInteraction(expanded, defect, corpus);
+            else
+                EnsureObserveStep(expanded, defect);
             return Deduplicate(expanded);
         }
 
@@ -69,6 +85,13 @@ public static class TicketStepPlanner
         if (LooksLikeChecklistTextResponseDefect(corpus))
         {
             AppendChecklistTextResponseRuntimeSteps(steps, defect);
+            return Deduplicate(steps);
+        }
+
+        // Multi-select assignee / stale filter typing — must open the control, type, select, reopen (not just land on Persons).
+        if (LooksLikeMultiSelectAssigneeTypingDefect(corpus))
+        {
+            EnsureMultiSelectAssigneeInteraction(steps, defect, corpus);
             return Deduplicate(steps);
         }
 
@@ -110,6 +133,8 @@ public static class TicketStepPlanner
         var corpus = $"{summary}\n{description}";
         if (LooksLikeChecklistTextResponseDefect(corpus))
             return "missing Text Response input (empty field-wrapper / data-response-type=4 on Checklist tab)";
+        if (LooksLikeMultiSelectAssigneeTypingDefect(corpus))
+            return "multi-select assignee filter leaves previous typed text after select/reopen";
         if (Regex.IsMatch(corpus, @"(?i)cannot read properties|js error toast|raw js"))
             return "raw JS error toast / Cannot read properties…";
         if (Regex.IsMatch(corpus, @"(?i)sent for approval|confirmation message|misleading"))
@@ -132,6 +157,16 @@ public static class TicketStepPlanner
         Regex.IsMatch(corpus, @"(?i)text\s*response") &&
         (Regex.IsMatch(corpus, @"(?i)field-wrapper|data-response-type|no input|renders\s+no|nothing clickable|cannot be answered") ||
          Regex.IsMatch(corpus, @"(?i)checklist"));
+
+    /// <summary>
+    /// Stale filter text in a multi-select assignee/people picker (Kendo MultiSelect input not cleared).
+    /// Accepts common ticket typos (e.g. "Mutlti select").
+    /// </summary>
+    public static bool LooksLikeMultiSelectAssigneeTypingDefect(string corpus) =>
+        Regex.IsMatch(corpus, @"(?i)mu[tl]{1,3}i[\s-]*select|multi[\s-]*select") &&
+        (Regex.IsMatch(corpus, @"(?i)assignee") ||
+         Regex.IsMatch(corpus, @"(?i)\b(team\s*members?|select\s+assignees?)\b")) &&
+        Regex.IsMatch(corpus, @"(?i)typ(e|ing|ed)|previous|remain|leaves|stale|clear|filter");
 
     /// <summary>
     /// Expand every Jira/inferred step; arrow chains become multiple browser actions.
@@ -338,6 +373,61 @@ public static class TicketStepPlanner
         steps.Add("Create or open an Incident matching the checklist Location + Incident Type");
         steps.Add("Open the Incident Checklist tab where answers are entered");
         steps.Add($"Observe whether this ticket's reported defect appears: {defect}");
+    }
+
+    private static void AppendMultiSelectAssigneeTypingSteps(List<string> steps, string defect)
+    {
+        EnsureMultiSelectAssigneeInteraction(steps, defect, corpus: "");
+    }
+
+    /// <summary>
+    /// Extends whatever nav we already have so the agent enters the multi-select UI and exercises typing —
+    /// never stop on Persons list with only an Observe step.
+    /// </summary>
+    public static void EnsureMultiSelectAssigneeInteraction(List<string> steps, string defect, string corpus)
+    {
+        var prefersPersons =
+            steps.Any(s => s.Contains("Person", StringComparison.OrdinalIgnoreCase)) ||
+            Regex.IsMatch(corpus, @"(?i)\bpersons?\b|\badministration\b");
+
+        // Drop a trailing Observe so we can insert real interaction first.
+        while (steps.Count > 0 && Regex.IsMatch(steps[^1], @"(?i)^observe"))
+            steps.RemoveAt(steps.Count - 1);
+
+        // Remove vague "add to an assignment" placeholders — replace with concrete Persons drill-in.
+        steps.RemoveAll(s =>
+            Regex.IsMatch(s, @"(?i)add to an assignment|from the current area UI") &&
+            !Regex.IsMatch(s, @"(?i)person-plus|multi-select|type a partial|select a matching|reopen"));
+
+        if (prefersPersons || steps.Any(s => s.Contains("Administration", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (!steps.Any(s => s.Contains("Administration", StringComparison.OrdinalIgnoreCase)))
+                steps.Insert(0, "Open Administration (app Administration area)");
+            if (!steps.Any(s => s.Contains("Person", StringComparison.OrdinalIgnoreCase)))
+                steps.Add("Open 'Persons' inside Administration");
+            if (!steps.Any(s => Regex.IsMatch(s, @"(?i)person-plus|edit groups|change assignments|first person row")))
+                steps.Add("Click person-plus / Groups (or Change Assignments) on the first active Persons row");
+            if (!steps.Any(s => Regex.IsMatch(s, @"(?i)open the .*multi-select|Assignees multi-select|Groups multi-select")))
+                steps.Add("Open the multi-select control on the dialog (Assignees / Groups / people picker)");
+        }
+        else
+        {
+            if (!steps.Any(s => s.Contains("Modules", StringComparison.OrdinalIgnoreCase)))
+                steps.Insert(0, "Open Modules menu");
+            if (!steps.Any(s => s.Contains("Recurring Activities", StringComparison.OrdinalIgnoreCase)))
+                steps.Add("Open module 'Recurring Activities'");
+            if (!steps.Any(s => Regex.IsMatch(s, @"(?i)Assignees multi-select|Select Assignees")))
+                steps.Add("Open the Assignees multi-select filter (Select Assignees)");
+        }
+
+        if (!steps.Any(s => Regex.IsMatch(s, @"(?i)type a partial name")))
+            steps.Add("Type a partial name into the multi-select filter input");
+        if (!steps.Any(s => Regex.IsMatch(s, @"(?i)select a matching")))
+            steps.Add("Select a matching assignee option from the multi-select list");
+        if (!steps.Any(s => Regex.IsMatch(s, @"(?i)reopen")))
+            steps.Add("Close or blur the multi-select, then reopen the Assignees multi-select");
+
+        EnsureObserveStep(steps, defect);
     }
 
     private static void EnsureObserveStep(List<string> steps, string defect)

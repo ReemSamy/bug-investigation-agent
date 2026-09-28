@@ -67,6 +67,30 @@ public class EnvironmentDiscoverySkillTests
         Assert.That(ctx.EnvironmentUrl, Is.EqualTo("https://kms14-portal-win-rel-scus.azurewebsites.net"));
         Assert.That(ctx.SystemName, Is.Null);
     }
+
+    [Test]
+    public async Task Ignores_azure_devops_pull_request_link_as_environment_url()
+    {
+        var ctx = new RuntimeContext
+        {
+            JiraTicketKey = "VKMS-4241",
+            Summary = "V14 - Beta - Multi select assignee",
+            Description = """
+                Linked PR: https://dev.azure.com/EHSQ/VisiumKMS/_git/kms-suite/pullrequest/3081
+                No portal URL listed on the ticket.
+                """,
+            JiraDetailsLoaded = true
+        };
+
+        var skill = new EnvironmentDiscoverySkill();
+        await skill.ExecuteAsync(new SkillExecutionRequest
+        {
+            Context = ctx,
+            Permissions = new PermissionGate(AgentPermission.ReadJira)
+        });
+
+        Assert.That(ctx.EnvironmentUrl, Is.Null);
+    }
 }
 
 public class JiraSkillParsingTests

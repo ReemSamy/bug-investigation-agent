@@ -52,6 +52,12 @@ public sealed class RuntimeContext
 
     public IList<string> StatusLog { get; set; } = new List<string>();
     public IList<string> AppliedMemoryLessonIds { get; set; } = new List<string>();
+
+    /// <summary>
+    /// Adaptive investigation bundle (LLM intent, similar Jira, KMS docs, etc.).
+    /// Raw Jira fields above remain the source of truth.
+    /// </summary>
+    public InvestigationBundle Investigation { get; set; } = new();
 }
 
 public sealed class AttachmentInfo
@@ -60,6 +66,8 @@ public sealed class AttachmentInfo
     public string Filename { get; set; } = "";
     public string? MimeType { get; set; }
     public string? Url { get; set; }
+    /// <summary>Local path after downloading the Jira attachment (images used as repro reference).</summary>
+    public string? LocalPath { get; set; }
 }
 
 public sealed class MissingField

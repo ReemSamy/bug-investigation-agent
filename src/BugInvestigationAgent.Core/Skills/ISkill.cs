@@ -36,6 +36,10 @@ public sealed class SkillResult
 public static class SkillIds
 {
     public const string Jira = "jira";
+    public const string TicketUnderstanding = "ticket-understanding";
+    public const string HistoricalJiraSearch = "historical-jira-search";
+    public const string HistoricalReproductionReuse = "historical-reproduction-reuse";
+    public const string KmsDocumentation = "kms-documentation";
     public const string EnvironmentDiscovery = "environment-discovery";
     public const string Credential = "credential";
     public const string BrowserAutomation = "browser-automation";

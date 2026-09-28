@@ -74,9 +74,12 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         session.Context.ProposedDiff = null;
         session.Context.ProposedFiles.Clear();
         session.Context.FinalStatusMessage = null;
+        session.Context.Investigation.Clear();
         session.Context.CustomFields.Remove("stepsInferredFromTicket");
         session.Context.CustomFields.Remove("inferredForTicket");
         session.Context.CustomFields.Remove("stepsFromJira");
+        session.Context.CustomFields.Remove("stepsFromHistoricalValidated");
+        session.Context.CustomFields.Remove("historicalStepsSource");
         session.Context.CustomFields.Remove("distinctScreenshotCount");
         session.Context.CustomFields.Remove("failedNavSteps");
         session.Context.CustomFields.Remove("investigationBlockedNoLlm");
@@ -295,6 +298,16 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 return;
             }
 
+            session.SetState(AgentState.UnderstandingTicket, "LLM structuring investigation intent from the ticket.");
+            await ExecuteSkillAsync(sp, SkillIds.TicketUnderstanding, session, cancellationToken);
+
+            session.SetState(AgentState.SearchingHistory, "Searching Jira for similar historical bugs.");
+            await ExecuteSkillAsync(sp, SkillIds.HistoricalJiraSearch, session, cancellationToken);
+            await ExecuteSkillAsync(sp, SkillIds.HistoricalReproductionReuse, session, cancellationToken);
+
+            session.SetState(AgentState.RetrievingDocs, "Retrieving relevant Visium KMS documentation.");
+            await ExecuteSkillAsync(sp, SkillIds.KmsDocumentation, session, cancellationToken);
+
             session.SetState(AgentState.ExtractingContext, "Inferring environment, user/role, and URLs from the ticket.");
             await ExecuteSkillAsync(sp, SkillIds.EnvironmentDiscovery, session, cancellationToken);
             await _missingInfoResolver.ResolveAsync(session.Context, vault, cancellationToken);
@@ -360,6 +373,13 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                         [
                             new MissingField
                             {
+                                Key = "environmentUrl",
+                                Label = "Environment URL (portal to test)",
+                                Reason = "Confirm or enter the portal URL (not Azure DevOps / Jira / PR). Then re-enter login.",
+                                InputType = "url"
+                            },
+                            new MissingField
+                            {
                                 Key = "credentials",
                                 Label = "Password for environment login",
                                 Reason = session.Context.ReproductionNotes
@@ -369,7 +389,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                             }
                         ];
                         session.Context.MissingInfoReason = session.Context.ReproductionNotes
-                            ?? "Previous attempt failed — update login and Continue.";
+                            ?? "Previous attempt failed — update environment URL + login and Continue.";
                     }
 
                     session.MissingInfoWaiter = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -518,6 +538,11 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                     break;
                 case "environmenturl":
                     context.EnvironmentUrl = EnvironmentUrlParser.NormalizeUrl(value);
+                    if (EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(context.EnvironmentUrl) &&
+                        Uri.TryCreate(context.EnvironmentUrl, UriKind.Absolute, out var envUri))
+                    {
+                        context.EnvironmentName = envUri.Host;
+                    }
                     break;
                 case "username":
                     context.Username = value.Trim();

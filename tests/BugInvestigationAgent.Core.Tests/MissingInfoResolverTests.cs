@@ -27,9 +27,10 @@ public class MissingInfoResolverTests
 
         await new MissingInfoResolver().ResolveAsync(ctx, vault.Object);
 
-        Assert.That(ctx.MissingFields.Count, Is.EqualTo(1));
-        Assert.That(ctx.MissingFields[0].Key, Is.EqualTo("credentials"));
-        Assert.That(ctx.MissingFields[0].Reason, Does.Contain("admin_dev"));
+        Assert.That(ctx.MissingFields.Count, Is.EqualTo(2));
+        Assert.That(ctx.MissingFields.Any(f => f.Key == "environmentUrl"), Is.True);
+        Assert.That(ctx.MissingFields.Any(f => f.Key == "credentials"), Is.True);
+        Assert.That(ctx.MissingFields.Single(f => f.Key == "credentials").Reason, Does.Contain("admin_dev"));
     }
 
     [Test]
@@ -53,6 +54,7 @@ public class MissingInfoResolverTests
 
         Assert.That(ctx.CredentialProfileId, Is.EqualTo(profile.Id));
         Assert.That(ctx.MissingFields.Any(f => f.Key == "credentials"), Is.True);
+        Assert.That(ctx.MissingFields.Any(f => f.Key == "environmentUrl"), Is.True);
         Assert.That(ctx.MissingFields.Single(f => f.Key == "credentials").Reason, Does.Contain("Saved credentials"));
     }
 
@@ -78,6 +80,52 @@ public class MissingInfoResolverTests
         await new MissingInfoResolver().ResolveAsync(ctx, vault.Object);
 
         Assert.That(ctx.MissingFields, Is.Empty);
+    }
+
+    [Test]
+    public async Task Rejects_azure_devops_pr_as_environment_and_asks_for_portal_url()
+    {
+        var vault = new Mock<ICredentialVault>();
+        vault.Setup(v => v.FindMatchAsync(It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((CredentialProfile?)null);
+
+        var ctx = new RuntimeContext
+        {
+            JiraDetailsLoaded = true,
+            WorkspacePath = Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar),
+            EnvironmentUrl = "https://dev.azure.com/EHSQ/VisiumKMS/_git/kms-suite/pullrequest/3081",
+            EnvironmentName = "dev.azure.com",
+            Username = "admin",
+            ReproductionSteps = { "Open page" }
+        };
+
+        await new MissingInfoResolver().ResolveAsync(ctx, vault.Object);
+
+        Assert.That(ctx.EnvironmentUrl, Is.Null);
+        Assert.That(ctx.MissingFields.Any(f => f.Key == "environmentUrl"), Is.True);
+        Assert.That(ctx.MissingFields.Single(f => f.Key == "environmentUrl").Reason, Does.Contain("Azure DevOps").Or.Contain("portal"));
+    }
+}
+
+public class EnvironmentUrlParserTests
+{
+    [Test]
+    public void Rejects_ado_pr_and_accepts_azurewebsites_portal()
+    {
+        Assert.That(
+            EnvironmentUrlParser.FindFirstUrl(
+                "See https://dev.azure.com/EHSQ/VisiumKMS/_git/kms-suite/pullrequest/3081"),
+            Is.Null);
+
+        Assert.That(
+            EnvironmentUrlParser.FindFirstUrl(
+                "Environment: https://kms14-portal-win-rel-scus.azurewebsites.net"),
+            Is.EqualTo("https://kms14-portal-win-rel-scus.azurewebsites.net"));
+
+        Assert.That(
+            EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(
+                "https://dev.azure.com/org/project/_git/repo"),
+            Is.False);
     }
 }
 

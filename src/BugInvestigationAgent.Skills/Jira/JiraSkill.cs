@@ -14,12 +14,18 @@ public sealed class JiraSkill : ISkill
 {
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IJiraConnectionSettings _jira;
+    private readonly AgentOptions _agentOptions;
     private readonly ILogger<JiraSkill> _logger;
 
-    public JiraSkill(IHttpClientFactory httpClientFactory, IJiraConnectionSettings jira, ILogger<JiraSkill> logger)
+    public JiraSkill(
+        IHttpClientFactory httpClientFactory,
+        IJiraConnectionSettings jira,
+        Microsoft.Extensions.Options.IOptions<AgentOptions> agentOptions,
+        ILogger<JiraSkill> logger)
     {
         _httpClientFactory = httpClientFactory;
         _jira = jira;
+        _agentOptions = agentOptions.Value;
         _logger = logger;
     }
 
@@ -113,6 +119,8 @@ public sealed class JiraSkill : ISkill
             request.Context.JiraDetailsLoaded = true;
             request.Progress?.Report(
                 $"Loaded {key}: envUrl={(request.Context.EnvironmentUrl ?? "pending discovery")}, fixVersion={request.Context.FixVersion ?? "?"}, steps={request.Context.ReproductionSteps.Count}, attachments={request.Context.Attachments.Count}.");
+
+            await DownloadImageAttachmentsAsync(client, request.Context, request.Progress, cancellationToken);
 
             try
             {
@@ -308,5 +316,61 @@ public sealed class JiraSkill : ISkill
             JsonValueKind.Object => el.ToString(),
             _ => el.ToString()
         };
+    }
+
+    private async Task DownloadImageAttachmentsAsync(
+        HttpClient client,
+        RuntimeContext context,
+        IProgress<string>? progress,
+        CancellationToken cancellationToken)
+    {
+        var images = context.Attachments
+            .Where(a =>
+                !string.IsNullOrWhiteSpace(a.Url) &&
+                (a.MimeType?.StartsWith("image/", StringComparison.OrdinalIgnoreCase) == true ||
+                 Regex.IsMatch(a.Filename ?? "", @"\.(png|jpe?g|gif|webp|bmp)$", RegexOptions.IgnoreCase)))
+            .Take(8)
+            .ToList();
+        if (images.Count == 0)
+            return;
+
+        var root = Path.IsPathRooted(_agentOptions.EvidenceDirectory)
+            ? _agentOptions.EvidenceDirectory
+            : Path.Combine(Directory.GetCurrentDirectory(), _agentOptions.EvidenceDirectory);
+        var dir = Path.Combine(root, context.SessionId.ToString("N"), "jira-attachments");
+        Directory.CreateDirectory(dir);
+
+        var downloaded = 0;
+        foreach (var att in images)
+        {
+            try
+            {
+                using var resp = await client.GetAsync(att.Url, cancellationToken);
+                if (!resp.IsSuccessStatusCode)
+                    continue;
+
+                var safeName = string.Join("_", (att.Filename ?? "attachment.png").Split(Path.GetInvalidFileNameChars()));
+                var local = Path.Combine(dir, $"{att.Id}_{safeName}");
+                await File.WriteAllBytesAsync(local, await resp.Content.ReadAsByteArrayAsync(cancellationToken), cancellationToken);
+                att.LocalPath = local;
+                context.Evidence.Add(new EvidenceItem
+                {
+                    Kind = "jira-attachment",
+                    Path = local,
+                    Caption = $"Jira attachment reference: {att.Filename} — reproduce this UI in the environment"
+                });
+                downloaded++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to download Jira attachment {File}", att.Filename);
+            }
+        }
+
+        if (downloaded > 0)
+        {
+            progress?.Report($"Downloaded {downloaded} Jira screenshot attachment(s) as reproduction references.");
+            context.CustomFields["jiraAttachmentImages"] = downloaded.ToString();
+        }
     }
 }

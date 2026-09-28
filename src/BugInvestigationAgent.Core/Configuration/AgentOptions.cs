@@ -18,6 +18,34 @@ public sealed class AgentOptions
 
     /// <summary>Playwright timing for slow portal pages (KMS Assignments spinner, modules, forms).</summary>
     public BrowserTimingOptions Browser { get; set; } = new();
+
+    /// <summary>Historical Jira search limits and toggles.</summary>
+    public HistoricalJiraOptions HistoricalJira { get; set; } = new();
+
+    /// <summary>Local Visium KMS markdown documentation for RAG retrieval.</summary>
+    public KmsDocsOptions KmsDocs { get; set; } = new();
+}
+
+public sealed class HistoricalJiraOptions
+{
+    public bool Enabled { get; set; } = true;
+    public int MaxCandidates { get; set; } = 15;
+    public int MaxRankedResults { get; set; } = 5;
+    /// <summary>Minimum LLM confidence (0-1) to adopt historical reproduction steps.</summary>
+    public double MinStepAdoptionConfidence { get; set; } = 0.7;
+    /// <summary>Minimum semantic score to keep an LLM-ranked candidate (exclude same-parent noise).</summary>
+    public double MinSemanticScore { get; set; } = 0.55;
+    /// <summary>Minimum keyword-overlap score when LLM ranking is unavailable.</summary>
+    public double MinKeywordScore { get; set; } = 0.25;
+}
+
+public sealed class KmsDocsOptions
+{
+    public bool Enabled { get; set; } = true;
+    /// <summary>Path to cloned ADO markdown documentation root.</summary>
+    public string? RootPath { get; set; }
+    public int MaxChunks { get; set; } = 6;
+    public int ChunkSizeChars { get; set; } = 1200;
 }
 
 public sealed class BrowserTimingOptions
@@ -34,6 +62,13 @@ public sealed class BrowserTimingOptions
     public int SpinnerTimeoutMs { get; set; } = 60_000;
     /// <summary>Short probe timeout when scanning for a button/link (ms). Keep small so missing labels don't freeze a step.</summary>
     public int ProbeTimeoutMs { get; set; } = 2_500;
+
+    /// <summary>
+    /// Deterministic = existing Playwright rules (default).
+    /// Adaptive = reserved for Playwright MCP observe/act loop.
+    /// Hybrid = try adaptive after deterministic nav failures (future).
+    /// </summary>
+    public string Mode { get; set; } = "Deterministic";
 }
 
 public sealed class AgentPermissionOptions

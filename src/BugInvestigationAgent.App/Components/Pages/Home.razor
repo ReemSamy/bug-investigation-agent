@@ -1,4 +1,4 @@
-﻿@page "/"
+@page "/"
 @rendermode InteractiveServer
 @using BugInvestigationAgent.Core.Context
 @using BugInvestigationAgent.Core.Credentials
@@ -107,7 +107,7 @@
                  && _session.Context.MissingFields.Count > 0)
             {
                 <h3>Next step — provide this to continue</h3>
-                <p class="muted">Portal login (not Atlassian). Then click Continue to retry reproduce.</p>
+                <p class="muted">Portal login (not Atlassian). Enter the <strong>environment URL</strong> you want tested, then username/password. Click Continue to retry reproduce.</p>
                 @foreach (var field in _session.Context.MissingFields)
                 {
                     <div class="field">
@@ -151,7 +151,9 @@
                         }
                         else if (field.Key == "environmentUrl")
                         {
-                            <input @bind="_missingValues[field.Key]" placeholder="https://my-env.example.com" />
+                            <input @bind="_missingValues[field.Key]"
+                                   placeholder="https://your-portal.azurewebsites.net"
+                                   style="width:100%" />
                         }
                         else
                         {
@@ -185,6 +187,103 @@
                     <dt>Notes</dt><dd>@_session.Context.ReproductionNotes</dd>
                 }
             </dl>
+
+            @if (_session.Context.Investigation.Intent is { } intent)
+            {
+                <h3>Investigation intent (LLM)</h3>
+                <dl class="kv">
+                    <dt>Problem</dt><dd>@(intent.ActualProblem ?? "—")</dd>
+                    <dt>Expected</dt><dd>@(intent.ExpectedBehavior ?? "—")</dd>
+                    <dt>Actual</dt><dd>@(intent.ActualBehavior ?? "—")</dd>
+                    <dt>Module</dt><dd>@(intent.AffectedModule ?? "—")</dd>
+                    <dt>Category</dt><dd>@(intent.BugCategory ?? "—")</dd>
+                    <dt>Keywords</dt><dd>@(intent.Keywords.Count == 0 ? "—" : string.Join(", ", intent.Keywords))</dd>
+                    <dt>Hints</dt><dd>@(intent.InvestigationHints.Count == 0 ? "—" : string.Join("; ", intent.InvestigationHints))</dd>
+                </dl>
+            }
+
+            @if (_session.Context.Investigation.SimilarIssues.Count > 0
+                || !string.IsNullOrWhiteSpace(_session.Context.Investigation.SimilarIssuesRankingNote))
+            {
+                <h3>Similar historical issues</h3>
+                @if (!string.IsNullOrWhiteSpace(_session.Context.Investigation.SimilarIssuesRankingNote))
+                {
+                    <p class="muted">@_session.Context.Investigation.SimilarIssuesRankingNote</p>
+                }
+                @if (_session.Context.Investigation.SimilarIssues.Count == 0)
+                {
+                    <p class="muted">No candidates met the similarity threshold.</p>
+                }
+                else
+                {
+                    <ul>
+                        @foreach (var s in _session.Context.Investigation.SimilarIssues)
+                        {
+                            <li>
+                                <strong>@s.Key</strong>
+                                @if (!string.IsNullOrWhiteSpace(s.SimilarityLevel))
+                                {
+                                    <text> · @s.SimilarityLevel</text>
+                                }
+                                @if (!string.IsNullOrWhiteSpace(s.Url))
+                                {
+                                    <text> — <a href="@s.Url" target="_blank" rel="noopener">open</a></text>
+                                }
+                                <div>@(s.Summary ?? "")</div>
+                                <div class="muted">
+                                    Score @s.RelevanceScore.ToString("0.00")
+                                    @(s.RankedByLlm ? " · LLM semantic" : " · keyword/JQL only")
+                                </div>
+                                <div class="muted">@(s.WhyRelevant ?? "")</div>
+                                @if (s.SameUnderlyingProblem || s.SimilarSymptoms || s.SameFunctionalArea || s.SimilarReproductionFlow)
+                                {
+                                    <div class="muted">
+                                        @(s.SameUnderlyingProblem ? "same problem · " : "")@(s.SimilarSymptoms ? "similar symptoms · " : "")@(s.SimilarReproductionFlow ? "similar repro · " : "")@(s.SameFunctionalArea ? "same area" : "")
+                                    </div>
+                                }
+                                @if (s.CandidateSteps.Count > 0)
+                                {
+                                    <div class="muted">Candidate reproduction steps: @s.CandidateSteps.Count</div>
+                                    @if (!string.IsNullOrWhiteSpace(s.CandidateStepsApplicability))
+                                    {
+                                        <div class="muted">@s.CandidateStepsApplicability</div>
+                                    }
+                                }
+                            </li>
+                        }
+                    </ul>
+                }
+            }
+
+            @if (_session.Context.Investigation.KmsDocuments.Count > 0)
+            {
+                <h3>KMS documentation</h3>
+                <ul>
+                    @foreach (var d in _session.Context.Investigation.KmsDocuments)
+                    {
+                        <li>
+                            <strong>@(d.Title ?? d.SourcePath)</strong>
+                            <div class="muted">@d.SourcePath (score @d.Score.ToString("0.0"))</div>
+                        </li>
+                    }
+                </ul>
+            }
+
+            @if (!string.IsNullOrWhiteSpace(_session.Context.Investigation.EvidenceReasoning) ||
+                 !string.IsNullOrWhiteSpace(_session.Context.Investigation.PotentialImpact))
+            {
+                <h3>Investigation reasoning</h3>
+                <dl class="kv">
+                    @if (!string.IsNullOrWhiteSpace(_session.Context.Investigation.EvidenceReasoning))
+                    {
+                        <dt>Evidence</dt><dd>@_session.Context.Investigation.EvidenceReasoning</dd>
+                    }
+                    @if (!string.IsNullOrWhiteSpace(_session.Context.Investigation.PotentialImpact))
+                    {
+                        <dt>Impact</dt><dd>@_session.Context.Investigation.PotentialImpact</dd>
+                    }
+                </dl>
+            }
 
             @if (_session.State is AgentState.FixProposed or AgentState.AwaitingApproval)
             {
@@ -334,6 +433,9 @@
     private static readonly AgentState[] _pipeline =
     [
         AgentState.ReadingJira,
+        AgentState.UnderstandingTicket,
+        AgentState.SearchingHistory,
+        AgentState.RetrievingDocs,
         AgentState.ExtractingContext,
         AgentState.AwaitingMissingInfo,
         AgentState.Reproducing,
@@ -502,7 +604,13 @@
             foreach (var f in fields)
             {
                 if (!_missingValues.ContainsKey(f.Key) && f.Key != "credentials")
-                    _missingValues[f.Key] = "";
+                {
+                    if (f.Key == "environmentUrl" &&
+                        EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(_session.Context.EnvironmentUrl))
+                        _missingValues[f.Key] = _session.Context.EnvironmentUrl!;
+                    else
+                        _missingValues[f.Key] = "";
+                }
             }
         }
         _ = InvokeAsync(StateHasChanged);

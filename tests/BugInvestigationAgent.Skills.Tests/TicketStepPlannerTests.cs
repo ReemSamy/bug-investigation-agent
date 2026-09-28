@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using BugInvestigationAgent.Core.Context;
 using BugInvestigationAgent.Skills.Jira;
 using BugInvestigationAgent.Skills.Reproduction;
@@ -149,5 +150,50 @@ public class TicketStepPlannerTests
         Assert.That(checklistTabIndex, Is.GreaterThan(addQuestionIndex));
         Assert.That(defect, Does.Contain("Text Response").IgnoreCase);
         Assert.That(defect, Does.Contain("field-wrapper").IgnoreCase);
+    }
+
+    [Test]
+    public void Vkms4241_infers_multiselect_assignee_interaction_not_persons_list_only()
+    {
+        var ctx = new RuntimeContext
+        {
+            JiraTicketKey = "VKMS-4241",
+            Summary = "V14 - Beta - Mutlti select assignee screen leaves previous typing",
+            Description = "When using the multi select assignee screen, previous typed text remains."
+        };
+
+        var steps = TicketStepPlanner.InferFromTicket(ctx);
+        var defect = TicketStepPlanner.DescribeDefect(ctx.Summary, ctx.Description);
+
+        Assert.That(TicketStepPlanner.LooksLikeMultiSelectAssigneeTypingDefect($"{ctx.Summary}\n{ctx.Description}"), Is.True);
+        Assert.That(steps.Any(s => s.Contains("Persons", StringComparison.OrdinalIgnoreCase) || s.Contains("Recurring Activities", StringComparison.OrdinalIgnoreCase)), Is.True);
+        Assert.That(steps.Any(s => s.Contains("person-plus", StringComparison.OrdinalIgnoreCase) || s.Contains("Assignees multi-select", StringComparison.OrdinalIgnoreCase) || s.Contains("multi-select control", StringComparison.OrdinalIgnoreCase)), Is.True);
+        Assert.That(steps.Any(s => s.Contains("Type a partial name", StringComparison.OrdinalIgnoreCase)), Is.True);
+        Assert.That(steps.Any(s => s.Contains("Select a matching assignee", StringComparison.OrdinalIgnoreCase)), Is.True);
+        Assert.That(steps.Any(s => s.Contains("reopen", StringComparison.OrdinalIgnoreCase)), Is.True);
+        Assert.That(steps.Any(s => s.Contains("add to an assignment", StringComparison.OrdinalIgnoreCase)), Is.False);
+        Assert.That(defect, Does.Contain("multi-select").IgnoreCase);
+    }
+
+    [Test]
+    public void Incomplete_jira_persons_path_gets_multiselect_interaction_appended()
+    {
+        var ctx = new RuntimeContext
+        {
+            JiraTicketKey = "VKMS-4241",
+            Summary = "V14 - Beta - Mutlti select assignee screen leaves previous typing",
+            Description =
+                """
+                Steps to Reproduce
+                1. Go to Administration > Persons
+                2. Open add to an assignment
+                """
+        };
+
+        var steps = TicketStepPlanner.InferFromTicket(ctx);
+
+        Assert.That(steps.Any(s => s.Contains("Type a partial name", StringComparison.OrdinalIgnoreCase)), Is.True);
+        Assert.That(steps.Any(s => s.Contains("reopen", StringComparison.OrdinalIgnoreCase)), Is.True);
+        Assert.That(steps.Count(s => Regex.IsMatch(s, @"(?i)^observe")), Is.EqualTo(1));
     }
 }

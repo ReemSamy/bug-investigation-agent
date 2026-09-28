@@ -4,6 +4,9 @@ public enum AgentState
 {
     Idle = 0,
     ReadingJira,
+    UnderstandingTicket,
+    SearchingHistory,
+    RetrievingDocs,
     ExtractingContext,
     AwaitingMissingInfo,
     ReadyToReproduce,
@@ -37,6 +40,9 @@ public static class AgentStateDisplay
     {
         AgentState.Idle => "Idle",
         AgentState.ReadingJira => "Reading Jira",
+        AgentState.UnderstandingTicket => "Understanding ticket",
+        AgentState.SearchingHistory => "Searching similar bugs",
+        AgentState.RetrievingDocs => "Retrieving KMS docs",
         AgentState.ExtractingContext => "Extracting environment",
         AgentState.AwaitingMissingInfo => "Missing information",
         AgentState.ReadyToReproduce => "Ready to reproduce",

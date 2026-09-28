@@ -50,6 +50,8 @@ public sealed class CodeInvestigationSkill : ISkill
 
         var keywords = ExtractKeywords(ctx);
         var snippets = SearchWorkspace(workspace, keywords, maxFiles: 12);
+        var browserObs = BuildBrowserObservations(ctx);
+        ctx.Investigation.BrowserObservationsSummary = browserObs;
 
         var system = string.Join("\n", safety.Concat(workspaceRules.Take(5)).Select(r => "- " + _redactor.Redact(r)));
         if (lessons.Count > 0)
@@ -58,15 +60,46 @@ public sealed class CodeInvestigationSkill : ISkill
                       string.Join("\n", lessons.Select(l => $"- { _redactor.Redact(l.Lesson)}"));
         }
 
+        var intent = ctx.Investigation.Intent;
+        var similar = string.Join("\n", ctx.Investigation.SimilarIssues.Take(5).Select(s =>
+            $"- {s.Key}: {s.Summary} | why={s.WhyRelevant} | score={s.RelevanceScore:0.00}"));
+        var docs = string.Join("\n---\n", ctx.Investigation.KmsDocuments.Take(4).Select(d =>
+            $"[{d.Title}] ({d.SourcePath})\n{d.Text}"));
+        var histSteps = ctx.Investigation.AdoptedHistoricalSteps.Count > 0
+            ? string.Join(" | ", ctx.Investigation.AdoptedHistoricalSteps)
+            : string.Join(" | ", ctx.Investigation.CandidateHistoricalSteps.Take(8));
+
         var userPrompt = $"""
             Analyze this bug and propose a minimal fix. Respond in JSON with keys:
-            rootCause, proposedFixSummary, proposedFiles (array of paths), proposedDiff (unified diff or empty if unsure).
+            rootCause, evidenceReasoning, potentialImpact, proposedFixSummary,
+            proposedFiles (array of paths), proposedDiff (unified diff or empty if unsure).
 
             Ticket: {ctx.JiraTicketKey}
             Summary: {_redactor.Redact(ctx.Summary)}
             Description: {_redactor.Redact(ctx.Description)}
             Reproduction steps: {_redactor.Redact(string.Join(" | ", ctx.ReproductionSteps))}
             Reproduction notes: {_redactor.Redact(ctx.ReproductionNotes)}
+            Reproduction outcome: {ctx.ReproductionOutcome}
+
+            LLM ticket understanding:
+            - problem: {_redactor.Redact(intent?.ActualProblem)}
+            - expected: {_redactor.Redact(intent?.ExpectedBehavior)}
+            - actual: {_redactor.Redact(intent?.ActualBehavior)}
+            - module: {_redactor.Redact(intent?.AffectedModule)}
+            - category: {_redactor.Redact(intent?.BugCategory)}
+            - hints: {_redactor.Redact(string.Join("; ", intent?.InvestigationHints ?? Array.Empty<string>()))}
+
+            Similar historical issues:
+            {_redactor.Redact(string.IsNullOrWhiteSpace(similar) ? "(none)" : similar)}
+
+            Candidate/adopted historical steps:
+            {_redactor.Redact(string.IsNullOrWhiteSpace(histSteps) ? "(none)" : histSteps)}
+
+            Relevant KMS documentation:
+            {_redactor.Redact(string.IsNullOrWhiteSpace(docs) ? "(none)" : docs)}
+
+            Browser evidence / observations:
+            {_redactor.Redact(browserObs)}
 
             Code snippets:
             {_redactor.Redact(snippets)}
@@ -134,6 +167,10 @@ public sealed class CodeInvestigationSkill : ISkill
                     ctx.ProposedFixSummary = pf.GetString();
                 if (root.TryGetProperty("proposedDiff", out var diff))
                     ctx.ProposedDiff = diff.GetString();
+                if (root.TryGetProperty("evidenceReasoning", out var er))
+                    ctx.Investigation.EvidenceReasoning = er.GetString();
+                if (root.TryGetProperty("potentialImpact", out var pi))
+                    ctx.Investigation.PotentialImpact = pi.GetString();
                 if (root.TryGetProperty("proposedFiles", out var files) && files.ValueKind == JsonValueKind.Array)
                 {
                     ctx.ProposedFiles = files.EnumerateArray().Select(x => x.GetString() ?? "").Where(s => s.Length > 0).ToList();
@@ -163,13 +200,31 @@ public sealed class CodeInvestigationSkill : ISkill
 
     private static List<string> ExtractKeywords(RuntimeContext ctx)
     {
-        var text = $"{ctx.Summary} {ctx.Description}";
+        var intentBits = ctx.Investigation.Intent is null
+            ? ""
+            : string.Join(" ", ctx.Investigation.Intent.Keywords.Concat(ctx.Investigation.Intent.RelevantEntities)
+                .Append(ctx.Investigation.Intent.AffectedModule ?? ""));
+        var text = $"{ctx.Summary} {ctx.Description} {intentBits}";
         return Regex.Matches(text, @"\b[A-Za-z][A-Za-z0-9_]{3,}\b")
             .Select(m => m.Value)
             .Where(w => !StopWords.Contains(w.ToLowerInvariant()))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(12)
             .ToList();
+    }
+
+    private static string BuildBrowserObservations(RuntimeContext ctx)
+    {
+        var lines = new List<string>();
+        if (!string.IsNullOrWhiteSpace(ctx.ReproductionNotes))
+            lines.Add("Notes: " + ctx.ReproductionNotes);
+        foreach (var e in ctx.Evidence.Take(20))
+        {
+            if (!string.IsNullOrWhiteSpace(e.Caption))
+                lines.Add($"{e.Kind}: {e.Caption}");
+        }
+
+        return lines.Count == 0 ? "(no browser observations)" : string.Join("\n", lines);
     }
 
     private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)

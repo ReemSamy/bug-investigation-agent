@@ -1,7 +1,9 @@
 using BugInvestigationAgent.Core.Configuration;
 using BugInvestigationAgent.Core.Credentials;
+using BugInvestigationAgent.Core.Knowledge;
 using BugInvestigationAgent.Core.Memory;
 using BugInvestigationAgent.Infrastructure.Credentials;
+using BugInvestigationAgent.Infrastructure.Knowledge;
 using BugInvestigationAgent.Infrastructure.Memory;
 using BugInvestigationAgent.Infrastructure.Persistence;
 using BugInvestigationAgent.Infrastructure.Settings;
@@ -41,6 +43,10 @@ public static class ServiceCollectionExtensions
 
         services.AddScoped<ICredentialVault, DataProtectionCredentialVault>();
         services.AddScoped<IEngineeringMemoryStore, EfEngineeringMemoryStore>();
+        services.AddSingleton<MarkdownKnowledgeStore>();
+        services.AddSingleton<IKnowledgeIngestionService>(sp => sp.GetRequiredService<MarkdownKnowledgeStore>());
+        services.AddSingleton<IKnowledgeRetriever>(sp => sp.GetRequiredService<MarkdownKnowledgeStore>());
+        services.AddSingleton<IEmbeddingProvider, NullEmbeddingProvider>();
         services.AddHostedService<DatabaseInitializer>();
         return services;
     }

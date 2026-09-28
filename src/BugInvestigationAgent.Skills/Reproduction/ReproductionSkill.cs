@@ -76,6 +76,13 @@ public sealed class ReproductionSkill : ISkill
                     ? $"Jira had no steps — inferred {steps.Count} navigation step(s) from the ticket summary/description."
                     : $"Following {steps.Count} reproduction step(s).");
 
+            var jiraShots = ctx.Attachments.Count(a => !string.IsNullOrWhiteSpace(a.LocalPath));
+            if (jiraShots > 0)
+            {
+                request.Progress?.Report(
+                    $"Using {jiraShots} Jira screenshot attachment(s) as visual reference — will open the same control and simulate the same typing/select behavior.");
+            }
+
             var pageErrors = new List<string>();
             void OnPageError(object? _, string err) => pageErrors.Add(err);
             page.PageError += OnPageError;
@@ -220,10 +227,27 @@ public sealed class ReproductionSkill : ISkill
             }
 
             bool defectSeen;
+            var hasStaleMultiSelectTyping = false;
+            if (TicketStepPlanner.LooksLikeMultiSelectAssigneeTypingDefect(corpus))
+            {
+                try
+                {
+                    hasStaleMultiSelectTyping = await page.EvaluateAsync<bool>(@"() => {
+                      const inputs = [...document.querySelectorAll('.k-multiselect .k-input-inner, .k-multiselect input.k-input, .k-multiselect .k-input')];
+                      return inputs.some(el => ((el.value || el.textContent || '').trim().length >= 2));
+                    }");
+                }
+                catch { /* ignore */ }
+            }
+
             if (TicketStepPlanner.LooksLikeChecklistTextResponseDefect(corpus))
             {
                 // Must see the empty Text Response control — admin setup alone is NOT reproduction.
                 defectSeen = hasEmptyTextResponseSignal && onIncidentChecklistTab && !onWrongChecklistAdmin;
+            }
+            else if (TicketStepPlanner.LooksLikeMultiSelectAssigneeTypingDefect(corpus))
+            {
+                defectSeen = hasStaleMultiSelectTyping;
             }
             else if (LooksLikeJsErrorTicket(ctx))
             {
@@ -241,9 +265,11 @@ public sealed class ReproductionSkill : ISkill
 
             var reachedFeature = TicketStepPlanner.LooksLikeChecklistTextResponseDefect(corpus)
                 ? onIncidentChecklistTab && !onWrongChecklistAdmin
-                : TicketStepPlanner.LooksLikeProposalFlow(corpus)
-                    ? onProposalPage
-                    : onCreateForm || onProposalPage || onIncidentChecklistTab;
+                : TicketStepPlanner.LooksLikeMultiSelectAssigneeTypingDefect(corpus)
+                    ? await DetectAssigneeMultiSelectPresentAsync(page)
+                    : TicketStepPlanner.LooksLikeProposalFlow(corpus)
+                        ? onProposalPage
+                        : onCreateForm || onProposalPage || onIncidentChecklistTab;
 
             if (onWrongChecklistAdmin && TicketStepPlanner.LooksLikeChecklistTextResponseDefect(corpus))
             {
@@ -299,7 +325,7 @@ public sealed class ReproductionSkill : ISkill
     private static bool RequiresPageChange(string step) =>
         // Only steps that must navigate away from the current screen.
         Regex.IsMatch(step, @"(?i)^open module\s+['""]|^open administration|create new|open the first|open '[^']+' from the (?:module|application|current area)|open '[^']+' inside administration|open '[^']+' \(next navigation")
-        && !Regex.IsMatch(step, @"(?i)^observe|^leave required|^confirm the|^open modules menu");
+        && !Regex.IsMatch(step, @"(?i)^observe|^leave required|^confirm the|^open modules menu|multi-select|type a partial|select a matching|reopen the assignees");
 
     private static async Task<string> CaptureFingerprintAsync(IPage page)
     {
@@ -433,6 +459,40 @@ public sealed class ReproductionSkill : ISkill
             return await ClickBestAsync(page, new[] { "Checklist", "Checklists" }, timing);
         }
 
+        if (Regex.IsMatch(text, @"(?i)assignees multi-select|select assignees|groups multi-select|multi-select control on the dialog|people picker"))
+        {
+            progress?.Report("Opening multi-select control…");
+            return await OpenAssigneeMultiSelectAsync(page, timing, progress);
+        }
+
+        if (Regex.IsMatch(text, @"(?i)person-plus|edit groups|change assignments|first (active )?persons? row|add to an assignment"))
+        {
+            progress?.Report("Opening Persons row action (person-plus / Change Assignments)…");
+            return await ClickPersonsRowActionAsync(page, timing, progress);
+        }
+
+        if (Regex.IsMatch(text, @"(?i)type a partial name into the multi-select"))
+        {
+            progress?.Report("Typing into multi-select filter…");
+            return await TypeIntoMultiSelectFilterAsync(page, "adm", timing, progress);
+        }
+
+        if (Regex.IsMatch(text, @"(?i)select a matching assignee option"))
+        {
+            progress?.Report("Selecting an assignee option from multi-select…");
+            return await SelectFirstMultiSelectOptionAsync(page, timing, progress);
+        }
+
+        if (Regex.IsMatch(text, @"(?i)reopen the assignees multi-select|close or blur the multi-select"))
+        {
+            progress?.Report("Closing then reopening Assignees multi-select…");
+            await page.Keyboard.PressAsync("Escape");
+            await page.WaitForTimeoutAsync(400);
+            await page.Mouse.ClickAsync(8, 8);
+            await page.WaitForTimeoutAsync(500);
+            return await OpenAssigneeMultiSelectAsync(page, timing, progress);
+        }
+
         var moduleMatch = Regex.Match(text, @"^(?i)open module\s+['""]?(.+?)['""]?\s*$");
         if (moduleMatch.Success)
         {
@@ -502,6 +562,18 @@ public sealed class ReproductionSkill : ISkill
 
         if (Regex.IsMatch(text, @"(?i)observe whether"))
         {
+            // Do not stop on a list page — for multi-select typing bugs, finish open/type/select/reopen.
+            if (Regex.IsMatch(text, @"(?i)multi-select|assignee|previous typ|leaves previous"))
+            {
+                progress?.Report("Observe step: finishing multi-select interaction (do not stop on Persons list)…");
+                if (!await DetectAssigneeMultiSelectPresentAsync(page))
+                    await ClickPersonsRowActionAsync(page, timing, progress);
+                await TypeIntoMultiSelectFilterAsync(page, "adm", timing, progress);
+                await SelectFirstMultiSelectOptionAsync(page, timing, progress);
+                await page.Keyboard.PressAsync("Escape");
+                await page.WaitForTimeoutAsync(400);
+                await OpenAssigneeMultiSelectAsync(page, timing, progress);
+            }
             await page.WaitForTimeoutAsync(Math.Max(2500, timing.PostActionDelayMs));
             return true;
         }
@@ -560,6 +632,162 @@ public sealed class ReproductionSkill : ISkill
 
         progress?.Report("No clickable audit/proposal grid row found.");
         return false;
+    }
+
+    private static async Task<bool> ClickPersonsRowActionAsync(IPage page, BrowserTimingOptions timing, IProgress<string>? progress)
+    {
+        // Prefer person-plus (edit Groups — opens MultiSelect). Fallback: Change Assignments.
+        var selectors = new[]
+        {
+            ".editGroupsButtonColumn:not(.k-state-disabled)",
+            "a.editGroupsButtonColumn",
+            ".bi-person-plus",
+            ".changeAssignmentsButtonColumn:not(.k-state-disabled)",
+            "a.changeAssignmentsButtonColumn"
+        };
+
+        foreach (var sel in selectors)
+        {
+            try
+            {
+                var loc = page.Locator(sel).First;
+                if (await loc.CountAsync() == 0 || !await loc.IsVisibleAsync())
+                    continue;
+                await loc.ClickAsync(new LocatorClickOptions { Timeout = Math.Min(timing.ActionTimeoutMs, 10_000) });
+                await BrowserWaits.WaitForPageReadyAsync(page, timing);
+                progress?.Report($"Clicked Persons row action ({sel}).");
+                return true;
+            }
+            catch (PlaywrightException)
+            {
+                // try next
+            }
+        }
+
+        progress?.Report("Could not click Persons person-plus / Change Assignments — trying generic icon buttons…");
+        return await ClickBestAsync(page, new[] { "Change Assignments", "Groups", "Edit Groups" }, timing);
+    }
+
+    private static async Task<bool> DetectAssigneeMultiSelectPresentAsync(IPage page)
+    {
+        try
+        {
+            return await page.EvaluateAsync<bool>(@"() => {
+              const body = (document.body?.innerText || '').toLowerCase();
+              if (body.includes('select assignees') || body.includes('filter assignees') || body.includes('groups'))
+                return !!document.querySelector('.k-multiselect, #FilterAssignees, [data-role=""multiselect""]');
+              return !!document.querySelector('#FilterAssignees, .k-multiselect, [data-role=""multiselect""]');
+            }");
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static async Task<bool> OpenAssigneeMultiSelectAsync(IPage page, BrowserTimingOptions timing, IProgress<string>? progress)
+    {
+        // Prefer dedicated FilterAssignees control on Recurring Activities scheduler.
+        try
+        {
+            var filter = page.Locator("#FilterAssignees").First;
+            if (await filter.CountAsync() > 0 && await filter.IsVisibleAsync())
+            {
+                await filter.ClickAsync(new LocatorClickOptions { Timeout = Math.Min(timing.ActionTimeoutMs, 10_000) });
+                await page.WaitForTimeoutAsync(400);
+                return true;
+            }
+        }
+        catch (PlaywrightException) { /* fall through */ }
+
+        var opened = await ClickBestAsync(
+            page,
+            new[] { "Select Assignees", "Assignees", "Assignee", "Add Team Members", "Team Members" },
+            timing);
+        if (!opened)
+        {
+            // Click the visible Kendo multi-select input area.
+            try
+            {
+                var ms = page.Locator(".k-multiselect .k-input-inner, .k-multiselect .k-input, .k-multiselect").First;
+                if (await ms.CountAsync() > 0)
+                {
+                    await ms.ClickAsync(new LocatorClickOptions { Timeout = 5_000 });
+                    opened = true;
+                }
+            }
+            catch (PlaywrightException) { /* ignore */ }
+        }
+
+        progress?.Report(opened ? "Assignees multi-select focused." : "Could not open Assignees multi-select.");
+        return opened;
+    }
+
+    private static async Task<bool> TypeIntoMultiSelectFilterAsync(
+        IPage page, string text, BrowserTimingOptions timing, IProgress<string>? progress)
+    {
+        await OpenAssigneeMultiSelectAsync(page, timing, progress);
+        try
+        {
+            var input = page.Locator(
+                "#FilterAssignees-list + .k-list-container input, .k-multiselect .k-input-inner, .k-multiselect input.k-input, .k-animation-container input, .k-list-filter input").First;
+            if (await input.CountAsync() > 0)
+            {
+                await input.FillAsync("");
+                await input.PressSequentiallyAsync(text, new LocatorPressSequentiallyOptions { Delay = 40 });
+            }
+            else
+            {
+                await page.Keyboard.TypeAsync(text, new KeyboardTypeOptions { Delay = 40 });
+            }
+
+            await page.WaitForTimeoutAsync(700);
+            progress?.Report($"Typed filter text '{text}' into multi-select.");
+            return true;
+        }
+        catch (PlaywrightException ex)
+        {
+            progress?.Report("Could not type into multi-select filter: " + ex.Message);
+            return false;
+        }
+    }
+
+    private static async Task<bool> SelectFirstMultiSelectOptionAsync(
+        IPage page, BrowserTimingOptions timing, IProgress<string>? progress)
+    {
+        try
+        {
+            var options = page.Locator(
+                ".k-animation-container .k-list-item, .k-list-container .k-item, ul[id*='FilterAssignees'] li, .k-list .k-item");
+            var count = await options.CountAsync();
+            for (var i = 0; i < Math.Min(count, 10); i++)
+            {
+                var opt = options.Nth(i);
+                if (!await opt.IsVisibleAsync())
+                    continue;
+                await opt.ClickAsync(new LocatorClickOptions { Timeout = Math.Min(timing.ActionTimeoutMs, 8_000) });
+                await page.WaitForTimeoutAsync(500);
+                progress?.Report("Selected a multi-select option.");
+                return true;
+            }
+        }
+        catch (PlaywrightException ex)
+        {
+            progress?.Report("Could not select multi-select option: " + ex.Message);
+        }
+
+        // Fallback: Enter on first filtered result.
+        try
+        {
+            await page.Keyboard.PressAsync("ArrowDown");
+            await page.Keyboard.PressAsync("Enter");
+            await page.WaitForTimeoutAsync(400);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static IEnumerable<string> ExpandLabels(string raw)
