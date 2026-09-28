@@ -1,0 +1,195 @@
+@page "/settings"
+@rendermode InteractiveServer
+@using BugInvestigationAgent.Core.Configuration
+@using BugInvestigationAgent.Core.Orchestration
+@using BugInvestigationAgent.Infrastructure.Settings
+@using Microsoft.Extensions.Options
+@inject LocalSettingsService LocalSettings
+@inject IOptionsSnapshot<AgentOptions> AgentOptions
+@inject IAgentRuntimeResolver RuntimeResolver
+@inject JiraConnectionTester JiraTester
+
+<PageTitle>Sign in — Bug Investigation Agent</PageTitle>
+
+<section class="panel">
+    <h2>Sign in with your Atlassian account</h2>
+    <p class="muted">
+        The agent reads Jira <strong>as you</strong> (your permissions, your tickets).
+        Atlassian does not allow apps to use your normal password — use your email + an
+        <strong>API token</strong> created for your account. That is your account login for this tool.
+    </p>
+
+    @if (LocalSettings.IsSignedIn)
+    {
+        <div class="banner success">
+            <strong>Signed in as @LocalSettings.SignedInDisplayName</strong>
+            <div>@LocalSettings.SignedInEmail</div>
+        </div>
+    }
+
+    @if (!string.IsNullOrWhiteSpace(_message))
+    {
+        <div class="banner @(_messageOk ? "success" : "warn")">@_message</div>
+    }
+
+    <h3>Your Atlassian account</h3>
+    <div class="field">
+        <label>Jira site</label>
+        <input @bind="_jiraBaseUrl" placeholder="https://ehsq.atlassian.net" />
+        <div class="muted" style="margin-top:0.35rem">Site root only (not a board link).</div>
+    </div>
+    <div class="field">
+        <label>Your Atlassian email</label>
+        <input @bind="_jiraEmail" placeholder="reem.mustafa@visiumkms.com" autocomplete="username" />
+        <div class="muted" style="margin-top:0.35rem">Must be the same account you use in the browser to open tickets.</div>
+    </div>
+    <div class="field">
+        <label>API token (acts as your password for the API)</label>
+        <input type="password" @bind="_jiraToken" placeholder="Paste API token" autocomplete="current-password" />
+        <div class="muted" style="margin-top:0.35rem">
+            1) Open <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noopener">id.atlassian.com → API tokens</a>
+            while logged in as yourself<br />
+            2) Create token → copy it → paste here<br />
+            3) Click <strong>Sign in</strong>
+        </div>
+    </div>
+    <div class="field">
+        <label>Optional: verify with a ticket you can open</label>
+        <input @bind="_sampleIssue" placeholder="VKMS-4180" />
+    </div>
+
+    <div class="btn-row">
+        <button class="btn" @onclick="SignInAsync" disabled="@_busy">@(_busy ? "Signing in…" : "Sign in with my account")</button>
+        @if (LocalSettings.IsSignedIn)
+        {
+            <button class="btn secondary" @onclick="SignOut">Sign out</button>
+        }
+        <a class="btn secondary" href="/">Back to Workflow</a>
+    </div>
+
+    <h3 style="margin-top:1.75rem">Default local workspace</h3>
+    <div class="field">
+        <label>Folder path on this PC</label>
+        <input @bind="_workspace" placeholder="C:\Users\...\source\repos\kms-suite" />
+    </div>
+    <button class="btn secondary" @onclick="SaveWorkspaceOnly">Save workspace</button>
+
+    <h3 style="margin-top:1.75rem">AI provider (optional)</h3>
+    <div class="field">
+        <label>Active provider</label>
+        <select @bind="_providerId">
+            @foreach (var id in RuntimeResolver.AvailableProviderIds)
+            {
+                <option value="@id">@id</option>
+            }
+        </select>
+    </div>
+    <div class="field">
+        <label>OpenAI-compatible API key</label>
+        <input type="password" @bind="_openAiKey" autocomplete="new-password" />
+    </div>
+    <div class="field">
+        <label>Anthropic API key</label>
+        <input type="password" @bind="_anthropicKey" autocomplete="new-password" />
+    </div>
+    <button class="btn secondary" @onclick="SaveAiOnly">Save AI settings</button>
+</section>
+
+@code {
+    private string _jiraBaseUrl = "https://ehsq.atlassian.net";
+    private string _jiraEmail = "";
+    private string _jiraToken = "";
+    private string _workspace = "";
+    private string _providerId = "null";
+    private string _openAiKey = "";
+    private string _anthropicKey = "";
+    private string _message = "";
+    private bool _messageOk;
+    private bool _busy;
+    private string _sampleIssue = "VKMS-4180";
+
+    protected override void OnInitialized() => Load();
+
+    private void Load()
+    {
+        var jira = LocalSettings.GetEffective();
+        _jiraBaseUrl = string.IsNullOrWhiteSpace(jira.BaseUrl) ? "https://ehsq.atlassian.net" : jira.BaseUrl;
+        _jiraEmail = jira.Email;
+        _jiraToken = jira.ApiToken;
+        _workspace = LocalSettings.DefaultWorkspacePath ?? "";
+        _providerId = LocalSettings.GetActiveProviderId();
+        var llm = LocalSettings.GetEffectiveLlm();
+        _openAiKey = llm.OpenAiCompatible.ApiKey;
+        _anthropicKey = llm.Anthropic.ApiKey;
+    }
+
+    private void PersistCredentials(bool clearSignedIn)
+    {
+        var doc = LocalSettings.Snapshot;
+        doc.Jira.BaseUrl = JiraUrlNormalizer.NormalizeBaseUrl(_jiraBaseUrl);
+        doc.Jira.Email = _jiraEmail.Trim();
+        if (!string.IsNullOrWhiteSpace(_jiraToken))
+            doc.Jira.ApiToken = _jiraToken.Trim();
+        if (clearSignedIn)
+        {
+            doc.JiraSignedInDisplayName = null;
+            doc.JiraSignedInEmail = null;
+            doc.JiraSignedInAtUtc = null;
+        }
+        LocalSettings.Save(doc);
+        _jiraBaseUrl = doc.Jira.BaseUrl;
+    }
+
+    private async Task SignInAsync()
+    {
+        _busy = true;
+        _message = "";
+        try
+        {
+            PersistCredentials(clearSignedIn: true);
+            var result = await JiraTester.SignInAsync(_sampleIssue);
+            _messageOk = result.Succeeded;
+            _message = result.Message;
+            Load();
+        }
+        catch (Exception ex)
+        {
+            _messageOk = false;
+            _message = ex.Message;
+            LocalSettings.ClearSignedInAccount();
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void SignOut()
+    {
+        LocalSettings.ClearSignedInAccount();
+        _messageOk = true;
+        _message = "Signed out. Tickets will not load until you sign in again.";
+    }
+
+    private void SaveWorkspaceOnly()
+    {
+        var doc = LocalSettings.Snapshot;
+        doc.DefaultWorkspacePath = string.IsNullOrWhiteSpace(_workspace) ? null : _workspace.Trim();
+        LocalSettings.Save(doc);
+        _messageOk = true;
+        _message = "Workspace saved.";
+    }
+
+    private void SaveAiOnly()
+    {
+        var doc = LocalSettings.Snapshot;
+        doc.ActiveProviderId = _providerId;
+        if (!string.IsNullOrWhiteSpace(_openAiKey))
+            doc.LlmProviders.OpenAiCompatible.ApiKey = _openAiKey.Trim();
+        if (!string.IsNullOrWhiteSpace(_anthropicKey))
+            doc.LlmProviders.Anthropic.ApiKey = _anthropicKey.Trim();
+        LocalSettings.Save(doc);
+        _messageOk = true;
+        _message = "AI settings saved.";
+    }
+}

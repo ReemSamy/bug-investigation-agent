@@ -1,0 +1,61 @@
+@page "/memory"
+@rendermode InteractiveServer
+@using BugInvestigationAgent.Core.Memory
+@inject IEngineeringMemoryStore MemoryStore
+
+<PageTitle>Engineering Memory</PageTitle>
+
+<section class="panel">
+    <h2>Engineering memory</h2>
+    <p class="muted">Only human-validated lessons are stored. Credentials are never accepted here.</p>
+
+    <div class="field">
+        <label>Scope key filter (e.g. workspace path)</label>
+        <input @bind="_scopeKey" />
+    </div>
+    <div class="field">
+        <label>Tags (comma-separated)</label>
+        <input @bind="_tags" />
+    </div>
+    <button class="btn secondary" @onclick="SearchAsync">Search</button>
+</section>
+
+<section class="panel">
+    <h3>Results</h3>
+    @if (_lessons.Count == 0)
+    {
+        <p class="muted">No lessons found.</p>
+    }
+    else
+    {
+        @foreach (var lesson in _lessons)
+        {
+            <article style="border-top:1px solid var(--border); padding:0.75rem 0;">
+                <div class="muted">@lesson.Scope · v@lesson.Version · @lesson.ValidatedAt.LocalDateTime · @lesson.ValidatedBy</div>
+                <p>@lesson.Lesson</p>
+                <div class="muted">Tags: @string.Join(", ", lesson.Tags)</div>
+                <button class="btn secondary" @onclick="() => DeactivateAsync(lesson.Id)">Deactivate</button>
+            </article>
+        }
+    }
+</section>
+
+@code {
+    private string _scopeKey = "";
+    private string _tags = "";
+    private List<EngineeringLesson> _lessons = new();
+
+    protected override async Task OnInitializedAsync() => await SearchAsync();
+
+    private async Task SearchAsync()
+    {
+        var tags = _tags.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        _lessons = (await MemoryStore.QueryRelevantAsync(string.IsNullOrWhiteSpace(_scopeKey) ? null : _scopeKey, tags)).ToList();
+    }
+
+    private async Task DeactivateAsync(Guid id)
+    {
+        await MemoryStore.DeactivateAsync(id);
+        await SearchAsync();
+    }
+}
