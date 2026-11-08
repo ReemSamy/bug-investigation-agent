@@ -1,7 +1,9 @@
+using BugInvestigationAgent.Core.Authentication;
 using BugInvestigationAgent.Core.Browser;
 using BugInvestigationAgent.Core.Configuration;
 using BugInvestigationAgent.Core.Context;
 using BugInvestigationAgent.Core.Credentials;
+using BugInvestigationAgent.Core.Environments;
 using BugInvestigationAgent.Core.Memory;
 using BugInvestigationAgent.Core.Permissions;
 using BugInvestigationAgent.Core.Rules;
@@ -32,6 +34,8 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
     private readonly IPermissionGate _permissions;
     private readonly IWorkspaceDefaults _workspaceDefaults;
     private readonly IBrowserSessionCloser _browserSessions;
+    private readonly IEnvironmentSelectionService _environments;
+    private readonly ISessionCredentialStore _sessionCredentials;
     private readonly ILogger<AgentOrchestrator> _logger;
     private readonly object _runGate = new();
     private CancellationTokenSource? _activeRunCts;
@@ -45,8 +49,12 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         IPermissionGate permissions,
         IWorkspaceDefaults workspaceDefaults,
         IBrowserSessionCloser browserSessions,
+        IEnvironmentSelectionService environments,
+        ISessionCredentialStore sessionCredentials,
         ILogger<AgentOrchestrator> logger)
     {
+        _environments = environments;
+        _sessionCredentials = sessionCredentials;
         _scopeFactory = scopeFactory;
         _sessions = sessions;
         _redactor = redactor;
@@ -84,6 +92,8 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         session.Context.CustomFields.Remove("failedNavSteps");
         session.Context.CustomFields.Remove("investigationBlockedNoLlm");
         session.Context.UserConfirmedReadyToReproduce = false;
+        ResetEnvironmentAndAuthentication(session.Context);
+        _sessionCredentials.Clear(session.Id);
         session.Context.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Starting fresh investigation for {session.Context.JiraTicketKey}.");
         _redactor.ClearSessionSecrets();
 
@@ -113,6 +123,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
             finally
             {
                 await _browserSessions.CloseAsync(sessionId);
+                _sessionCredentials.Clear(sessionId);
                 lock (_runGate)
                 {
                     if (_activeRunSessionId == sessionId)
@@ -135,8 +146,9 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         CancellationToken cancellationToken = default)
     {
         var session = RequireSession(sessionId);
+        var ctx = session.Context;
         var hadTicketPaste = values.Keys.Any(k => k.Equals("ticketText", StringComparison.OrdinalIgnoreCase));
-        ApplyUserValues(session.Context, values);
+        ApplyUserValues(ctx, values);
 
         using var scope = _scopeFactory.CreateScope();
         var vault = scope.ServiceProvider.GetRequiredService<ICredentialVault>();
@@ -147,76 +159,158 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
             await ExecuteSkillAsync(scope.ServiceProvider, SkillIds.EnvironmentDiscovery, session, cancellationToken);
         }
 
+        // ── Manual authentication step (MFA etc.) ──────────────────────────
+        var authAction = Value(values, "authAction");
+        if (string.Equals(authAction, "recheck", StringComparison.OrdinalIgnoreCase)
+            && ctx.AuthenticationStatus is AuthenticationStatus.MfaRequired or AuthenticationStatus.ManualInterventionRequired)
+        {
+            ctx.AuthenticationRecheckRequested = true;
+            await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
+            ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} User reports the additional sign-in step is complete — re-checking.");
+            session.NotifyChanged();
+            session.MissingInfoWaiter?.TrySetResult(true);
+            return;
+        }
+
+        if (string.Equals(authAction, "restart", StringComparison.OrdinalIgnoreCase))
+        {
+            await _browserSessions.CloseAsync(session.Id);
+            ctx.AuthenticationStatus = AuthenticationStatus.NotStarted;
+            ctx.AuthenticationMessage = null;
+            ctx.AuthenticationRecheckRequested = false;
+            ctx.EnvironmentSelectionConfirmed = false;
+            ctx.UserConfirmedReadyToReproduce = false;
+            await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
+            session.SetState(AgentState.AwaitingMissingInfo, "Choose the environment and enter its credentials again.");
+            return;
+        }
+
+        // ── Environment selection ───────────────────────────────────────────
+        var environmentId = Value(values, "environmentId");
+        if (environmentId is not null)
+        {
+            var previousEnv = ctx.SelectedEnvironmentId;
+            var selection = _environments.Select(ctx, environmentId, Value(values, "environmentUrl"));
+            if (!selection.IsValid)
+            {
+                ctx.UserConfirmedReadyToReproduce = false;
+                await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
+                session.SetState(AgentState.AwaitingMissingInfo, selection.Error);
+                return;
+            }
+
+            if (!string.Equals(previousEnv, ctx.SelectedEnvironmentId, StringComparison.OrdinalIgnoreCase))
+            {
+                // Different environment → never reuse the previous browser session or its credentials.
+                await _browserSessions.CloseAsync(session.Id);
+                _sessionCredentials.Clear(session.Id);
+            }
+
+            ctx.StatusLog.Add(
+                $"{DateTimeOffset.UtcNow:HH:mm:ss} Environment selected: {selection.Environment!.DisplayName} ({selection.Environment.Type}) — {selection.Environment.SafeBaseUrl}" +
+                (selection.Environment.IsProduction ? " — PRODUCTION: read-only investigation." : "."));
+        }
+
+        if (ctx.IsReadOnlyEnvironment)
+            ctx.StateChangingActionsConfirmed = string.Equals(Value(values, "allowStateChangingActions"), "true", StringComparison.OrdinalIgnoreCase);
+
+        var environment = _environments.ResolveSelected(ctx);
+
+        // ── Credentials (environment-specific) ─────────────────────────────
         if (newCredentials is not null)
         {
+            if (environment is null)
+            {
+                ctx.UserConfirmedReadyToReproduce = false;
+                ctx.EnvironmentSelectionError ??= "Select a valid environment before entering credentials.";
+                await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
+                session.SetState(AgentState.AwaitingMissingInfo, ctx.EnvironmentSelectionError);
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(newCredentials.Username) ||
+                (string.IsNullOrEmpty(newCredentials.Password) && string.IsNullOrEmpty(newCredentials.Token)))
+            {
+                ctx.UserConfirmedReadyToReproduce = false;
+                await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
+                session.SetState(AgentState.AwaitingMissingInfo, $"Enter both the username and password for {environment.DisplayName}.");
+                return;
+            }
+
             _redactor.RegisterSecret(newCredentials.Password);
             _redactor.RegisterSecret(newCredentials.Token);
+            _sessionCredentials.Set(session.Id, environment.Id, newCredentials);
+            ctx.CredentialProfileId = null;
+            ctx.Username = newCredentials.Username;
+            ctx.AuthenticationStatus = AuthenticationStatus.NotStarted;
+            ctx.AuthenticationMessage = null;
 
-            if (saveCredentialProfile || session.Context.CredentialProfileId is null)
+            // Persist ONLY on explicit opt-in. Default: credentials live in memory for this investigation only.
+            if (saveCredentialProfile)
             {
-                var labelParts = new[]
+                var existing = await vault.FindForEnvironmentAsync(environment.Id, newCredentials.Username, cancellationToken);
+                var saved = await vault.SaveProfileAsync(new CredentialProfile
                 {
-                    session.Context.SystemName,
-                    session.Context.EnvironmentName,
-                    session.Context.Username ?? session.Context.Role
-                }.Where(s => !string.IsNullOrWhiteSpace(s));
-
-                var profile = new CredentialProfile
-                {
-                    Label = string.Join(" + ", labelParts),
-                    SystemName = session.Context.SystemName,
-                    EnvironmentName = session.Context.EnvironmentName,
+                    Id = existing?.Id ?? Guid.NewGuid(),
+                    Label = $"{environment.DisplayName} + {newCredentials.Username}",
+                    SystemName = environment.ApplicationId ?? ctx.SystemName,
+                    EnvironmentName = environment.DisplayName,
+                    EnvironmentId = environment.Id,
                     Username = newCredentials.Username,
-                    Role = session.Context.Role,
+                    Role = ctx.Role,
                     AuthType = string.IsNullOrWhiteSpace(newCredentials.Token) ? "password" : "token"
-                };
-
-                if (string.IsNullOrWhiteSpace(session.Context.Username))
-                    session.Context.Username = newCredentials.Username;
-
-                var saved = await vault.SaveProfileAsync(profile, newCredentials, cancellationToken);
-                session.Context.CredentialProfileId = saved.Id;
+                }, newCredentials, cancellationToken);
+                ctx.CredentialProfileId = saved.Id;
+                ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Credentials for {environment.DisplayName} saved encrypted (user opted in).");
+            }
+        }
+        else if (ctx.CredentialProfileId is Guid chosenProfile)
+        {
+            // Saved profile chosen in the UI: it must belong to the current user AND the selected environment.
+            var profile = await vault.GetProfileAsync(chosenProfile, cancellationToken);
+            if (profile is null || profile.IsLegacyUnscoped || environment is null ||
+                !string.Equals(profile.EnvironmentId, environment.Id, StringComparison.OrdinalIgnoreCase))
+            {
+                ctx.CredentialProfileId = null;
+                ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Ignored a saved credential profile that does not belong to the selected environment.");
+            }
+            else
+            {
+                ctx.Username = profile.Username;
+                ctx.AuthenticationStatus = AuthenticationStatus.NotStarted;
+                ctx.AuthenticationMessage = null;
             }
         }
 
-        // User explicitly clicked Continue — allow reproduce even when only confirming saved credentials.
-        session.Context.UserConfirmedReadyToReproduce = true;
-        if (session.Context.ReproductionOutcome is ReproductionOutcome.Error
+        // User explicitly clicked Continue — allow reproduce once the resolver is satisfied.
+        ctx.UserConfirmedReadyToReproduce = true;
+        if (ctx.ReproductionOutcome is ReproductionOutcome.Error
             or ReproductionOutcome.Blocked
             or ReproductionOutcome.EnvironmentUnavailable)
         {
-            session.Context.ReproductionOutcome = ReproductionOutcome.NotStarted;
-            session.Context.ReproductionNotes = null;
+            ctx.ReproductionOutcome = ReproductionOutcome.NotStarted;
+            ctx.ReproductionNotes = null;
         }
 
-        await _missingInfoResolver.ResolveAsync(session.Context, vault, cancellationToken);
+        await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
 
         // Optional steps: blank textarea should not block continue.
-        session.Context.MissingFields = session.Context.MissingFields
+        ctx.MissingFields = ctx.MissingFields
             .Where(f => f.Key != "reproductionSteps")
             .ToList();
-        if (session.Context.MissingFields.Count == 0)
-            session.Context.MissingInfoReason = null;
+        if (ctx.MissingFields.Count == 0)
+            ctx.MissingInfoReason = null;
 
         session.NotifyChanged();
 
-        if (!session.Context.JiraDetailsLoaded)
+        if (!ctx.JiraDetailsLoaded)
         {
             session.SetState(AgentState.Failed,
                 "Cannot continue: Jira ticket was not loaded. Fix API credentials and Analyze again.");
             return;
         }
 
-        if (session.Context.CredentialProfileId is null && newCredentials is null
-            && !values.ContainsKey("credentialProfileId"))
-        {
-            session.Context.UserConfirmedReadyToReproduce = false;
-            await _missingInfoResolver.ResolveAsync(session.Context, vault, cancellationToken);
-            session.SetState(AgentState.AwaitingMissingInfo, "Environment password is still required before reproduce.");
-            return;
-        }
-
-        if (session.Context.MissingFields.Count == 0)
+        if (ctx.MissingFields.Count == 0)
         {
             session.MissingInfoWaiter?.TrySetResult(true);
             // Pipeline is already awaiting MissingInfoWaiter; do not start a second continue here
@@ -234,8 +328,8 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         }
         else
         {
-            session.Context.UserConfirmedReadyToReproduce = false;
-            session.SetState(AgentState.AwaitingMissingInfo, session.Context.MissingInfoReason ?? "Still missing required fields.");
+            ctx.UserConfirmedReadyToReproduce = false;
+            session.SetState(AgentState.AwaitingMissingInfo, ctx.MissingInfoReason ?? "Still missing required fields.");
         }
     }
 
@@ -338,7 +432,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Pipeline failed for session {SessionId}", session.Id);
+            _logger.LogError("Pipeline failed for session {SessionId}: {Message}", session.Id, _redactor.Redact(ex.Message));
             session.LastError = _redactor.Redact(ex.Message);
             session.SetState(AgentState.Failed, session.LastError);
         }
@@ -351,9 +445,11 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
             var vault = sp.GetRequiredService<ICredentialVault>();
             var memoryStore = sp.GetRequiredService<IEngineeringMemoryStore>();
 
-            session.SetState(AgentState.ReadyToReproduce, "Context resolved. Starting reproduction.");
-            session.SetState(AgentState.ConnectingEnvironment, "Opening environment with the ticket's user/role.");
-            await ExecuteSkillAsync(sp, SkillIds.BrowserAutomation, session, cancellationToken);
+            session.SetState(AgentState.ReadyToReproduce, "Context resolved. Signing in to the selected environment before reproduction.");
+
+            // Hard gate: reproduction never starts before a verified, successful sign-in.
+            if (!await AuthenticateAsync(sp, session, vault, cancellationToken))
+                return;
 
             session.SetState(AgentState.Reproducing, "Following Jira reproduction steps (or steps inferred from the ticket summary).");
             await ExecuteSkillAsync(sp, SkillIds.Reproduction, session, cancellationToken);
@@ -364,7 +460,11 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 case ReproductionOutcome.EnvironmentUnavailable:
                 case ReproductionOutcome.Error:
                     await _browserSessions.CloseAsync(session.Id);
+                    _sessionCredentials.Clear(session.Id);
                     session.Context.UserConfirmedReadyToReproduce = false;
+                    // Browser closed → the next attempt must sign in again.
+                    session.Context.AuthenticationStatus = AuthenticationStatus.NotStarted;
+                    session.Context.AuthenticationRecheckRequested = false;
                     session.Context.ReproductionNotes = TruncateNotes(session.Context.ReproductionNotes);
                     await _missingInfoResolver.ResolveAsync(session.Context, vault, cancellationToken);
                     if (session.Context.MissingFields.Count == 0)
@@ -373,15 +473,15 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                         [
                             new MissingField
                             {
-                                Key = "environmentUrl",
-                                Label = "Environment URL (portal to test)",
-                                Reason = "Confirm or enter the portal URL (not Azure DevOps / Jira / PR). Then re-enter login.",
-                                InputType = "url"
+                                Key = MissingInfoResolver.EnvironmentFieldKey,
+                                Label = "Environment to investigate",
+                                Reason = "Confirm the environment (or choose another), then re-enter the login.",
+                                InputType = "environment"
                             },
                             new MissingField
                             {
-                                Key = "credentials",
-                                Label = "Password for environment login",
+                                Key = MissingInfoResolver.CredentialsFieldKey,
+                                Label = "Credentials for the selected environment",
                                 Reason = session.Context.ReproductionNotes
                                          ?? "Previous login/reproduce attempt failed. Re-enter credentials and click Continue.",
                                 IsSecret = true,
@@ -389,7 +489,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                             }
                         ];
                         session.Context.MissingInfoReason = session.Context.ReproductionNotes
-                            ?? "Previous attempt failed — update environment URL + login and Continue.";
+                            ?? "Previous attempt failed — confirm the environment, re-enter the login and Continue.";
                     }
 
                     session.MissingInfoWaiter = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -412,8 +512,8 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 case ReproductionOutcome.Ambiguous:
                     await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
                     session.Context.FinalStatusMessage = session.Context.ReproductionOutcome == ReproductionOutcome.NotReproduced
-                        ? $"Could not reproduce {session.Context.JiraTicketKey} — the reported issue was not found. Review Evidence."
-                        : $"Could not confirm reproduction for {session.Context.JiraTicketKey}. Review Evidence for that ticket’s feature path, add clearer Jira steps if needed, then Analyze again.";
+                        ? $"Could not reproduce {session.Context.JiraTicketKey} on {session.Context.SelectedEnvironmentDisplayName ?? "the selected environment"} — the reported issue was not found. Review Evidence."
+                        : $"Could not confirm reproduction for {session.Context.JiraTicketKey} on {session.Context.SelectedEnvironmentDisplayName ?? "the selected environment"}. Review Evidence for that ticket’s feature path, add clearer Jira steps if needed, then Analyze again.";
                     session.SetState(AgentState.Completed, session.Context.FinalStatusMessage);
                     return;
                 case ReproductionOutcome.Reproduced:
@@ -435,6 +535,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
 
             if (session.Context.CustomFields.ContainsKey("investigationBlockedNoLlm"))
             {
+                await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
                 session.Context.FinalStatusMessage =
                     "Reproduction finished, but no code fix was proposed because no LLM API key is configured. " +
                     "Add OpenAI/Anthropic in Sign in / Account, then Analyze again. Review Evidence screenshots meanwhile.";
@@ -448,6 +549,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
             var approved = await session.ApprovalWaiter.Task.WaitAsync(cancellationToken);
             if (!approved)
             {
+                await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
                 session.Context.FinalStatusMessage = "Fix rejected by user.";
                 session.SetState(AgentState.Completed, session.Context.FinalStatusMessage);
                 return;
@@ -478,13 +580,85 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Continuation failed for session {SessionId}", session.Id);
+            _logger.LogError("Continuation failed for session {SessionId}: {Message}", session.Id, _redactor.Redact(ex.Message));
             session.LastError = _redactor.Redact(ex.Message);
             session.SetState(AgentState.Failed, session.LastError);
         }
         finally
         {
             await _browserSessions.CloseAsync(session.Id);
+            _sessionCredentials.Clear(session.Id);
+        }
+    }
+
+    /// <summary>
+    /// Signs in to the selected environment through the browser skill and loops until the sign-in is verified,
+    /// the user fixes credentials / picks another environment, or completes a manual (MFA) step.
+    /// Returns false when the run stopped without a successful sign-in.
+    /// </summary>
+    private async Task<bool> AuthenticateAsync(IServiceProvider sp, AgentSession session, ICredentialVault vault, CancellationToken cancellationToken)
+    {
+        var ctx = session.Context;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var environment = _environments.ResolveSelected(ctx);
+            var recheck = ctx.AuthenticationRecheckRequested
+                          && ctx.AuthenticationStatus is AuthenticationStatus.MfaRequired or AuthenticationStatus.ManualInterventionRequired;
+            ctx.AuthenticationRecheckRequested = false;
+
+            session.SetState(
+                AgentState.Authenticating,
+                recheck
+                    ? $"Re-checking sign-in to {environment?.DisplayName ?? "the environment"} after the manual step."
+                    : $"Opening {environment?.DisplayName ?? "the environment"} ({environment?.SafeBaseUrl ?? "no URL"}) in an isolated browser and signing in.");
+
+            await ExecuteSkillAsync(
+                sp,
+                SkillIds.BrowserAutomation,
+                session,
+                new Dictionary<string, string> { ["mode"] = recheck ? "recheck" : "login" },
+                cancellationToken);
+
+            if (ctx.AuthenticationStatus == AuthenticationStatus.Succeeded)
+            {
+                ctx.ReproductionOutcome = ReproductionOutcome.NotStarted;
+                ctx.ReproductionNotes = null;
+                ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Signed in to {environment?.DisplayName}. {ctx.AuthenticationMessage}");
+                session.SetState(AgentState.ConnectingEnvironment, "Sign-in verified. Continuing with reproduction.");
+                return true;
+            }
+
+            var manualStep = ctx.AuthenticationStatus is AuthenticationStatus.MfaRequired or AuthenticationStatus.ManualInterventionRequired;
+            if (!manualStep)
+            {
+                // Failed attempt: drop the browser session and any remaining in-memory secret.
+                await _browserSessions.CloseAsync(session.Id);
+                _sessionCredentials.Clear(session.Id);
+                if (ctx.AuthenticationStatus is AuthenticationStatus.InvalidCredentials or AuthenticationStatus.SessionExpired)
+                    ctx.CredentialProfileId = null; // saved credentials failed — ask instead of retrying them silently
+            }
+
+            ctx.UserConfirmedReadyToReproduce = false;
+            await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
+            if (ctx.MissingFields.Count == 0)
+            {
+                // Defensive: never loop silently without asking the user.
+                ctx.EnvironmentSelectionConfirmed = false;
+                await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
+            }
+
+            session.MissingInfoWaiter = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            session.SetState(
+                AgentState.AwaitingMissingInfo,
+                ctx.AuthenticationMessage ?? ctx.ReproductionNotes ?? "Sign-in did not succeed. Update the environment login and Continue.");
+
+            var proceed = await session.MissingInfoWaiter.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!proceed)
+            {
+                session.SetState(AgentState.Blocked, "Stopped: sign-in to the environment did not complete.");
+                return false;
+            }
         }
     }
 
@@ -536,14 +710,8 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 case "workspacepath":
                     context.WorkspacePath = value.Trim();
                     break;
-                case "environmenturl":
-                    context.EnvironmentUrl = EnvironmentUrlParser.NormalizeUrl(value);
-                    if (EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(context.EnvironmentUrl) &&
-                        Uri.TryCreate(context.EnvironmentUrl, UriKind.Absolute, out var envUri))
-                    {
-                        context.EnvironmentName = envUri.Host;
-                    }
-                    break;
+                // environmentId / environmentUrl / allowStateChangingActions / authAction are handled by
+                // IEnvironmentSelectionService in SubmitMissingInfoAsync (validated selection, never raw assignment).
                 case "username":
                     context.Username = value.Trim();
                     break;
@@ -578,6 +746,36 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                     break;
             }
         }
+    }
+
+    private static string? Value(IDictionary<string, string> values, string key)
+    {
+        foreach (var (k, v) in values)
+        {
+            if (string.Equals(k, key, StringComparison.OrdinalIgnoreCase))
+                return string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+        }
+
+        return null;
+    }
+
+    private static void ResetEnvironmentAndAuthentication(RuntimeContext context)
+    {
+        context.SuggestedEnvironmentId = null;
+        context.SuggestedEnvironmentReason = null;
+        context.SuggestedAdHocUrl = null;
+        context.SelectedEnvironmentId = null;
+        context.SelectedEnvironmentDisplayName = null;
+        context.SelectedEnvironmentType = null;
+        context.EnvironmentSelectionConfirmed = false;
+        context.EnvironmentSelectionError = null;
+        context.IsReadOnlyEnvironment = false;
+        context.StateChangingActionsConfirmed = false;
+        context.SkippedStateChangingSteps.Clear();
+        context.CredentialProfileId = null;
+        context.AuthenticationStatus = AuthenticationStatus.NotStarted;
+        context.AuthenticationMessage = null;
+        context.AuthenticationRecheckRequested = false;
     }
 
     private static string? TruncateNotes(string? notes)

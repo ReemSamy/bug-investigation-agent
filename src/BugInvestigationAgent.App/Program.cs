@@ -7,7 +7,13 @@ using BugInvestigationAgent.Skills;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Machine-local overrides (environment URLs, login selectors). Git-ignored; never put credentials here.
+builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
+builder.Configuration.AddEnvironmentVariables();
+
 builder.Services.Configure<AgentOptions>(builder.Configuration.GetSection(AgentOptions.SectionName));
+builder.Services.Configure<BugInvestigationAgent.Core.Environments.EnvironmentRegistryOptions>(
+    builder.Configuration.GetSection(BugInvestigationAgent.Core.Environments.EnvironmentRegistryOptions.SectionName));
 builder.Services.Configure<JiraOptions>(builder.Configuration.GetSection(JiraOptions.SectionName));
 builder.Services.Configure<LlmProviderOptions>(builder.Configuration.GetSection(LlmProviderOptions.SectionName));
 

@@ -1,5 +1,7 @@
+using BugInvestigationAgent.Core.Authentication;
 using BugInvestigationAgent.Core.Configuration;
 using BugInvestigationAgent.Core.Credentials;
+using BugInvestigationAgent.Core.Environments;
 using BugInvestigationAgent.Core.Workflow;
 
 namespace BugInvestigationAgent.Core.Context;
@@ -9,19 +11,38 @@ public interface IMissingInfoResolver
     Task ResolveAsync(RuntimeContext context, ICredentialVault vault, CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// Decides what the user must provide before reproduction: workspace, the environment to investigate,
+/// environment-specific credentials, manual authentication steps (MFA) and optional reproduction steps.
+/// </summary>
 public sealed class MissingInfoResolver : IMissingInfoResolver
 {
+    public const string EnvironmentFieldKey = "environment";
+    public const string CredentialsFieldKey = "credentials";
+    public const string AuthenticationActionFieldKey = "authenticationAction";
+
     private readonly IWorkspaceDefaults _workspaceDefaults;
     private readonly IJiraConnectionSettings _jira;
+    private readonly IEnvironmentSelectionService _environments;
+    private readonly ISessionCredentialStore _sessionCredentials;
 
-    public MissingInfoResolver(IWorkspaceDefaults workspaceDefaults, IJiraConnectionSettings jira)
+    public MissingInfoResolver(
+        IWorkspaceDefaults workspaceDefaults,
+        IJiraConnectionSettings jira,
+        IEnvironmentSelectionService environments,
+        ISessionCredentialStore sessionCredentials)
     {
         _workspaceDefaults = workspaceDefaults;
         _jira = jira;
+        _environments = environments;
+        _sessionCredentials = sessionCredentials;
     }
 
+    /// <summary>Test/default constructor: no registered environments, manual URLs allowed.</summary>
     public MissingInfoResolver()
-        : this(new EmptyWorkspaceDefaults(), new EmptyJiraSettings())
+        : this(new EmptyWorkspaceDefaults(), new EmptyJiraSettings(),
+            new EnvironmentSelectionService(new ConfigurationEnvironmentRegistry(new EnvironmentRegistryOptions())),
+            new InMemorySessionCredentialStore())
     {
     }
 
@@ -64,13 +85,17 @@ public sealed class MissingInfoResolver : IMissingInfoResolver
             });
         }
 
-        context.EnvironmentUrl = EnvironmentUrlParser.NormalizeUrl(context.EnvironmentUrl);
-        if (!EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(context.EnvironmentUrl))
+        var selected = _environments.ResolveSelected(context);
+        if (selected is not null)
+        {
+            // Registry (or validated ad-hoc) URL is authoritative for the selected environment.
+            context.EnvironmentUrl = selected.BaseUrl;
+        }
+        else
         {
             // ADO/PR/Jira links are ticket metadata — never treat them as the portal to open.
-            if (!string.IsNullOrWhiteSpace(context.EnvironmentUrl) ||
-                string.Equals(context.EnvironmentName, "dev.azure.com", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(context.EnvironmentName, "visualstudio.com", StringComparison.OrdinalIgnoreCase))
+            context.EnvironmentUrl = EnvironmentUrlParser.NormalizeUrl(context.EnvironmentUrl);
+            if (!EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(context.EnvironmentUrl))
             {
                 context.EnvironmentUrl = null;
                 if (string.Equals(context.EnvironmentName, "dev.azure.com", StringComparison.OrdinalIgnoreCase) ||
@@ -78,48 +103,76 @@ public sealed class MissingInfoResolver : IMissingInfoResolver
                     context.EnvironmentName = null;
             }
         }
+        var manualAuthPending = context.AuthenticationStatus is AuthenticationStatus.MfaRequired
+            or AuthenticationStatus.ManualInterventionRequired;
 
-        var needsUserIdentity = string.IsNullOrWhiteSpace(context.Username) && string.IsNullOrWhiteSpace(context.Role);
-        var match = await vault.FindMatchAsync(
-            context.SystemName,
-            context.EnvironmentName,
-            context.Username,
-            context.Role,
-            cancellationToken);
-
-        if (match is not null && context.CredentialProfileId is null)
+        if (manualAuthPending && selected is not null)
         {
-            context.CredentialProfileId = match.Id;
-            if (string.IsNullOrWhiteSpace(context.Username))
-                context.Username = match.Username;
+            // Browser is still open on the MFA / manual step — only ask the user to complete it (or start over).
+            if (!context.AuthenticationRecheckRequested)
+            {
+                missing.Add(new MissingField
+                {
+                    Key = AuthenticationActionFieldKey,
+                    Label = $"Complete sign-in to {selected.DisplayName}",
+                    Reason = context.AuthenticationMessage
+                             ?? "The environment needs an additional sign-in step. Complete it, then re-check.",
+                    InputType = "auth-manual"
+                });
+            }
+
+            Finish(context, missing);
+            return;
         }
 
-        var needsCredentialsGate = !context.UserConfirmedReadyToReproduce
-            || context.CredentialProfileId is null;
-        var needsEnvironmentUrl = !EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(context.EnvironmentUrl);
-
-        // Ask for portal URL when missing/invalid, and also while confirming credentials so the user can override a wrong auto-detect.
-        if (needsEnvironmentUrl || needsCredentialsGate)
+        // ── Environment ─────────────────────────────────────────────────────
+        var needsEnvironment = selected is null
+                               || !context.EnvironmentSelectionConfirmed
+                               || !context.UserConfirmedReadyToReproduce;
+        if (needsEnvironment)
         {
             missing.Add(new MissingField
             {
-                Key = "environmentUrl",
-                Label = "Environment URL (portal to test)",
-                Reason = needsEnvironmentUrl
-                    ? "Provide the KMS/portal environment URL to open in the browser (for example https://….azurewebsites.net). " +
-                      "Do not use Azure DevOps, Jira, or pull-request links — those are not the application under test."
-                    : "Confirm this is the application environment the agent should open (not Azure DevOps / Jira / PR links).",
-                InputType = "url"
+                Key = EnvironmentFieldKey,
+                Label = "Environment to investigate",
+                Reason = BuildEnvironmentReason(context, selected),
+                InputType = "environment"
             });
         }
 
-        if (needsCredentialsGate)
+        // ── Credentials (environment-specific) ─────────────────────────────
+        var credentialsReady = false;
+        if (selected is not null)
         {
+            credentialsReady = !selected.Login.RequiresLogin
+                               || _sessionCredentials.Has(context.InvestigationId, selected.Id);
+
+            if (!credentialsReady && context.CredentialProfileId is Guid profileId)
+            {
+                var profile = await vault.GetProfileAsync(profileId, cancellationToken);
+                if (profile is not null && !profile.IsLegacyUnscoped
+                    && string.Equals(profile.EnvironmentId, selected.Id, StringComparison.OrdinalIgnoreCase))
+                    credentialsReady = true;
+                else
+                    context.CredentialProfileId = null; // never use credentials saved for another environment
+            }
+        }
+
+        var needsCredentials = selected is null
+            || (selected.Login.RequiresLogin && (!credentialsReady || !context.UserConfirmedReadyToReproduce));
+        if (needsCredentials)
+        {
+            CredentialProfile? saved = null;
+            if (selected is not null)
+                saved = await vault.FindForEnvironmentAsync(selected.Id, null, cancellationToken);
+
             missing.Add(new MissingField
             {
-                Key = "credentials",
-                Label = needsUserIdentity ? "Environment username & password" : "Password for environment login",
-                Reason = BuildCredentialReason(context, match),
+                Key = CredentialsFieldKey,
+                Label = selected is null
+                    ? "Environment username & password"
+                    : $"Credentials for {selected.DisplayName}",
+                Reason = BuildCredentialReason(context, selected, saved),
                 IsSecret = true,
                 InputType = "credentials"
             });
@@ -136,33 +189,72 @@ public sealed class MissingInfoResolver : IMissingInfoResolver
             });
         }
 
-        context.MissingFields = missing;
-        context.MissingInfoReason = missing.Count == 0
-            ? null
-            : string.IsNullOrWhiteSpace(context.ReproductionNotes)
-                ? "Ticket loaded from Jira. Enter the environment login below, then click Continue."
-                : context.ReproductionNotes;
+        Finish(context, missing);
     }
 
-    private static string BuildCredentialReason(RuntimeContext context, CredentialProfile? match)
+    private static void Finish(RuntimeContext context, List<MissingField> missing)
     {
+        context.MissingFields = missing;
+        if (missing.Count == 0)
+        {
+            context.MissingInfoReason = null;
+            return;
+        }
+
+        context.MissingInfoReason =
+            !string.IsNullOrWhiteSpace(context.EnvironmentSelectionError) ? context.EnvironmentSelectionError
+            : !string.IsNullOrWhiteSpace(context.AuthenticationMessage)
+              && context.AuthenticationStatus is not AuthenticationStatus.NotStarted and not AuthenticationStatus.Succeeded
+                ? context.AuthenticationMessage
+            : !string.IsNullOrWhiteSpace(context.ReproductionNotes) ? context.ReproductionNotes
+            : "Ticket loaded from Jira. Select the environment to investigate and enter its login, then click Continue.";
+    }
+
+    private string BuildEnvironmentReason(RuntimeContext context, AppEnvironment? selected)
+    {
+        if (!string.IsNullOrWhiteSpace(context.EnvironmentSelectionError))
+            return context.EnvironmentSelectionError!;
+
+        if (selected is not null)
+            return $"Confirm {selected.DisplayName} ({selected.SafeBaseUrl}) or choose another environment.";
+
+        var reason = context.SuggestedEnvironmentReason
+                     ?? "Select the environment on which the bug should be investigated.";
+        if (!string.IsNullOrWhiteSpace(context.FixPullRequestUrl))
+            reason += $" Note: the ticket links a fix PR ({context.FixPullRequestUrl}) — that is not an environment; pick where the fix may be deployed.";
+        return reason;
+    }
+
+    private static string BuildCredentialReason(RuntimeContext context, AppEnvironment? selected, CredentialProfile? saved)
+    {
+        var envName = selected?.DisplayName ?? "the selected environment";
+
+        if ((context.AuthenticationStatus is AuthenticationStatus.InvalidCredentials
+                or AuthenticationStatus.SessionExpired
+                or AuthenticationStatus.Failed
+                or AuthenticationStatus.CredentialsRequired)
+            && !string.IsNullOrWhiteSpace(context.AuthenticationMessage))
+        {
+            return $"{context.AuthenticationMessage} Re-enter the {envName} credentials (or choose another environment) and click Continue.";
+        }
+
         if (!string.IsNullOrWhiteSpace(context.ReproductionNotes) &&
             context.ReproductionOutcome is ReproductionOutcome.Error
                 or ReproductionOutcome.Blocked
                 or ReproductionOutcome.EnvironmentUnavailable)
         {
-            return $"{context.ReproductionNotes} Enter/update the portal password for '{context.Username ?? context.Role ?? "user"}' and click Continue to retry.";
+            return $"{context.ReproductionNotes} Enter the {envName} login again and click Continue to retry.";
         }
 
-        if (match is not null || context.CredentialProfileId is not null)
-        {
-            return $"Saved credentials found for '{context.Username ?? match?.Username ?? "user"}'. " +
-                   "Confirm by clicking Continue (or enter a new password to replace them).";
-        }
+        if (saved is not null)
+            return $"Saved credentials found for '{saved.Username}' on {envName}. Use them, or enter different credentials for this investigation.";
 
-        return string.IsNullOrWhiteSpace(context.Username) && string.IsNullOrWhiteSpace(context.Role)
-            ? "Enter the username/password used to log into the environment URL."
-            : $"Enter the password for user '{context.Username ?? context.Role}' to log into the environment.";
+        if (selected is null)
+            return "Select an environment first. Credentials are requested per environment and are never reused for another environment.";
+
+        return string.IsNullOrWhiteSpace(context.Username)
+            ? $"Enter the username and password used to sign in to {envName}. They are used for this investigation only unless you choose to remember them."
+            : $"Enter the password for '{context.Username}' on {envName}. Used for this investigation only unless you choose to remember them.";
     }
 
     private static MissingField SettingsField(string reason) => new()

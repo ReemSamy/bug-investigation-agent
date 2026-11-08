@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "bug-investigation-agent",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["run", "--project", "src/BugInvestigationAgent.App", "--launch-profile", "http"],
+      "port": 5149
+    }
+  ]
+}

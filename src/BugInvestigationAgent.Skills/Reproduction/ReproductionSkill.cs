@@ -1,11 +1,14 @@
 using System.Text.RegularExpressions;
+using BugInvestigationAgent.Core.Authentication;
 using BugInvestigationAgent.Core.Configuration;
 using BugInvestigationAgent.Core.Context;
+using BugInvestigationAgent.Core.Environments;
 using BugInvestigationAgent.Core.Permissions;
 using BugInvestigationAgent.Core.Security;
 using BugInvestigationAgent.Core.Skills;
 using BugInvestigationAgent.Core.Workflow;
 using BugInvestigationAgent.Skills.Browser;
+using BugInvestigationAgent.Skills.Evidence;
 using Microsoft.Extensions.Options;
 using Microsoft.Playwright;
 
@@ -16,12 +19,18 @@ public sealed class ReproductionSkill : ISkill
     private readonly AgentOptions _options;
     private readonly ISecretRedactor _redactor;
     private readonly IPlaywrightSessionHub _sessions;
+    private readonly IEnvironmentSelectionService? _environments;
 
-    public ReproductionSkill(IOptions<AgentOptions> options, ISecretRedactor redactor, IPlaywrightSessionHub sessions)
+    public ReproductionSkill(
+        IOptions<AgentOptions> options,
+        ISecretRedactor redactor,
+        IPlaywrightSessionHub sessions,
+        IEnvironmentSelectionService? environments = null)
     {
         _options = options.Value;
         _redactor = redactor;
         _sessions = sessions;
+        _environments = environments;
     }
 
     public string SkillId => SkillIds.Reproduction;
@@ -45,6 +54,15 @@ public sealed class ReproductionSkill : ISkill
             return SkillResult.Ok("Reproduction skipped — prior technical/environment failure preserved.");
         }
 
+        // Hard gate: never reproduce (or retest) before a verified sign-in to the selected environment.
+        if (ctx.AuthenticationStatus != AuthenticationStatus.Succeeded)
+        {
+            ctx.ReproductionOutcome = ReproductionOutcome.Blocked;
+            ctx.ReproductionNotes = "Reproduction cannot start before a successful sign-in to the selected environment.";
+            request.Progress?.Report(ctx.ReproductionNotes);
+            return SkillResult.Ok(ctx.ReproductionNotes);
+        }
+
         if (string.IsNullOrWhiteSpace(ctx.EnvironmentUrl))
         {
             ctx.ReproductionOutcome = ReproductionOutcome.Blocked;
@@ -52,10 +70,13 @@ public sealed class ReproductionSkill : ISkill
             return SkillResult.Ok(ctx.ReproductionNotes);
         }
 
-        var evidenceDir = Path.Combine(
-            Path.IsPathRooted(_options.EvidenceDirectory) ? _options.EvidenceDirectory : Path.Combine(Directory.GetCurrentDirectory(), _options.EvidenceDirectory),
-            ctx.SessionId.ToString("N"));
-        Directory.CreateDirectory(evidenceDir);
+        var login = _environments?.ResolveSelected(ctx)?.Login;
+        if (ctx.IsReadOnlyEnvironment)
+        {
+            request.Progress?.Report(ctx.StateChangingActionsConfirmed
+                ? "PRODUCTION: user explicitly allowed potentially state-changing steps for this investigation."
+                : "PRODUCTION: read-only investigation — steps that could create, modify, submit or delete data will be skipped.");
+        }
 
         try
         {
@@ -102,6 +123,16 @@ public sealed class ReproductionSkill : ISkill
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     stepIndex++;
+                    if (ProductionSafetyPolicy.MustSkip(ctx, step))
+                    {
+                        ctx.SkippedStateChangingSteps.Add(step);
+                        request.Progress?.Report($"Step {stepIndex}/{steps.Count} SKIPPED (read-only Production environment, potentially state-changing): {step}");
+                        ctx.Evidence.Add(EvidenceItem.For(ctx, "note", null,
+                            $"Step {stepIndex} skipped — read-only Production investigation; requires explicit confirmation: {step}",
+                            EvidenceCategories.Note));
+                        continue;
+                    }
+
                     request.Progress?.Report($"Step {stepIndex}/{steps.Count}: {step}");
                     var before = previousFingerprint;
                     var stepOk = true;
@@ -136,26 +167,20 @@ public sealed class ReproductionSkill : ISkill
                     // Skip duplicate screenshots when the page did not change (except observe steps).
                     if (!changed && distinctShots > 0 && !Regex.IsMatch(step, @"(?i)^observe"))
                     {
-                        ctx.Evidence.Add(new EvidenceItem
-                        {
-                            Kind = "note",
-                            Caption = $"Step {stepIndex} skipped duplicate screenshot — UI unchanged after: {step}"
-                        });
+                        ctx.Evidence.Add(EvidenceItem.For(ctx, "note", null,
+                            $"Step {stepIndex} skipped duplicate screenshot — UI unchanged after: {step}",
+                            EvidenceCategories.Note));
                         previousFingerprint = after;
                         continue;
                     }
 
-                    var shot = Path.Combine(evidenceDir, $"{(isRetest ? "retest" : "repro")}-step-{stepIndex:00}.png");
-                    await page.ScreenshotAsync(new PageScreenshotOptions { Path = shot, FullPage = true });
+                    await EvidenceScreenshots.CaptureAsync(page, _options, ctx,
+                        $"{(isRetest ? "retest" : "repro")}-step-{stepIndex:00}",
+                        stepOk && (changed || !requiresNav)
+                            ? $"Step {stepIndex}: {_redactor.Redact(step)}"
+                            : $"Step {stepIndex} (FAILED — UI may be unchanged): {_redactor.Redact(step)}",
+                        EvidenceCategories.Workflow, login);
                     distinctShots++;
-                    ctx.Evidence.Add(new EvidenceItem
-                    {
-                        Kind = "screenshot",
-                        Path = shot,
-                        Caption = stepOk && (changed || !requiresNav)
-                            ? $"Step {stepIndex}: {step}"
-                            : $"Step {stepIndex} (FAILED — UI may be unchanged): {step}"
-                    });
                     previousFingerprint = after;
                 }
 
@@ -219,11 +244,8 @@ public sealed class ReproductionSkill : ISkill
 
             if (pageErrors.Count > 0)
             {
-                ctx.Evidence.Add(new EvidenceItem
-                {
-                    Kind = "error",
-                    Caption = _redactor.Redact(string.Join(" | ", pageErrors.Take(5)))
-                });
+                ctx.Evidence.Add(EvidenceItem.For(ctx, "error", null,
+                    _redactor.Redact(string.Join(" | ", pageErrors.Take(5))), EvidenceCategories.ErrorMessage));
             }
 
             bool defectSeen;
@@ -276,6 +298,11 @@ public sealed class ReproductionSkill : ISkill
                 ctx.Evidence.Add(new EvidenceItem
                 {
                     Kind = "note",
+                    Category = EvidenceCategories.Note,
+                    JiraTicketKey = ctx.JiraTicketKey,
+                    InvestigationId = ctx.InvestigationId,
+                    EnvironmentId = ctx.SelectedEnvironmentId,
+                    EnvironmentName = ctx.SelectedEnvironmentDisplayName,
                     Caption = "Navigation landed on Pre-MOC Questionnaires — ticket requires Administration → Checklist → Incident (Investigator Checklists), then Incident Checklist tab."
                 });
             }
@@ -305,6 +332,14 @@ public sealed class ReproductionSkill : ISkill
                     : $"Investigated {ctx.JiraTicketKey}, but did not finish the full ticket path (stopped before the defect screen). Distinct screenshots={distinct}, failed navigation steps={failed}. Still need: {defect}.";
             }
 
+            await CaptureOutcomeEvidenceAsync(page, ctx, defectSeen, isRetest, defect, login);
+
+            if (ctx.SkippedStateChangingSteps.Count > 0 && ctx.ReproductionOutcome != ReproductionOutcome.Reproduced)
+            {
+                ctx.ReproductionNotes +=
+                    $" {ctx.SkippedStateChangingSteps.Count} potentially state-changing step(s) were skipped because the environment is Production (read-only).";
+            }
+
             return SkillResult.Ok($"Reproduction classified as {ctx.ReproductionOutcome} for {ctx.JiraTicketKey}.");
         }
         catch (PlaywrightException ex) when (ex.Message.Contains("Executable doesn't exist", StringComparison.OrdinalIgnoreCase)
@@ -319,6 +354,58 @@ public sealed class ReproductionSkill : ISkill
             ctx.ReproductionOutcome = ReproductionOutcome.Error;
             ctx.ReproductionNotes = _redactor.Redact(ex.Message);
             return SkillResult.Ok("Reproduction ended with technical ERROR (not NOT_REPRODUCED).");
+        }
+    }
+
+    private static readonly string[] ErrorUiSelectors =
+    [
+        "[role=alert]:visible",
+        ".toast-error:visible",
+        ".k-notification-error:visible",
+        ".validation-summary-errors:visible",
+        ".alert-danger:visible",
+        ".error-message:visible"
+    ];
+
+    /// <summary>Screenshots of the observed bug / final state and of any visible error message.</summary>
+    private async Task CaptureOutcomeEvidenceAsync(IPage page, RuntimeContext ctx, bool defectSeen, bool isRetest, string defect, LoginFormOptions? login)
+    {
+        var prefix = isRetest ? "retest" : "repro";
+        try
+        {
+            await EvidenceScreenshots.CaptureAsync(page, _options, ctx, $"{prefix}-final-state",
+                defectSeen
+                    ? $"Observed failure state — {_redactor.Redact(defect)}"
+                    : $"Final state after following the steps (defect not clearly observed: {_redactor.Redact(defect)})",
+                defectSeen ? EvidenceCategories.FailureState : EvidenceCategories.Workflow, login);
+
+            foreach (var selector in ErrorUiSelectors)
+            {
+                var loc = page.Locator(selector).First;
+                if (await loc.CountAsync() == 0)
+                    continue;
+                var path = Path.Combine(EvidenceScreenshots.EvidenceDirectory(_options, ctx),
+                    EvidenceScreenshots.FileName(ctx, $"{prefix}-error-message"));
+                await loc.ScreenshotAsync(new LocatorScreenshotOptions
+                {
+                    Path = path,
+                    Mask = EvidenceScreenshots.MaskSelectors(login).Select(s => page.Locator(s)).ToArray(),
+                    Timeout = 5_000
+                });
+                var text = "";
+                try { text = (await loc.InnerTextAsync(new LocatorInnerTextOptions { Timeout = 2_000 })).Trim(); } catch { /* ignore */ }
+                ctx.Evidence.Add(EvidenceItem.For(ctx, "screenshot", path,
+                    "Error message shown by the application" + (string.IsNullOrWhiteSpace(text) ? "" : $": {_redactor.Redact(text.Length > 200 ? text[..200] + "…" : text)}"),
+                    EvidenceCategories.ErrorMessage));
+                break;
+            }
+        }
+        catch (PlaywrightException)
+        {
+            // Evidence capture is best-effort and must not change the reproduction outcome.
+        }
+        catch (TimeoutException)
+        {
         }
     }
 

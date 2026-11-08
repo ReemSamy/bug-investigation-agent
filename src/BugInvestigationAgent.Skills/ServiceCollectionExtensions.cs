@@ -24,6 +24,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IPlaywrightSessionHub>(sp => sp.GetRequiredService<PlaywrightSessionHub>());
         services.AddSingleton<BugInvestigationAgent.Core.Browser.IBrowserSessionCloser>(sp => sp.GetRequiredService<PlaywrightSessionHub>());
 
+        services.AddSingleton<BugInvestigationAgent.Skills.Browser.Authentication.LoginFlow>();
         services.AddSingleton<IJiraIssueSearchClient, JiraIssueSearchClient>();
         services.AddSingleton<DeterministicPlaywrightBrowserSurface>();
         services.AddSingleton<PlaywrightMcpBrowserSurface>();

@@ -69,6 +69,12 @@ public sealed class BrowserTimingOptions
     /// Hybrid = try adaptive after deterministic nav failures (future).
     /// </summary>
     public string Mode { get; set; } = "Deterministic";
+
+    /// <summary>
+    /// Run Chromium without a window (default). Set false to watch the run and to complete MFA / manual
+    /// sign-in steps yourself in the opened browser window.
+    /// </summary>
+    public bool Headless { get; set; } = true;
 }
 
 public sealed class AgentPermissionOptions

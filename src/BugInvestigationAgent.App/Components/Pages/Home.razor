@@ -9,7 +9,10 @@
 @inject IAgentSessionStore Sessions
 @inject IAgentOrchestrator Orchestrator
 @inject ICredentialVault CredentialVault
+@inject BugInvestigationAgent.Core.Environments.IEnvironmentSelectionService EnvironmentSelection
 @inject BugInvestigationAgent.Core.Configuration.IJiraConnectionSettings JiraConnection
+@using BugInvestigationAgent.Core.Authentication
+@using BugInvestigationAgent.Core.Environments
 @implements IDisposable
 
 <PageTitle>Workflow — Bug Investigation Agent</PageTitle>
@@ -30,6 +33,13 @@
     <div class="banner warn">
         <strong>@AgentStateDisplay.Label(_session.State)</strong>
         <div>@(_session.Context.ReproductionNotes ?? _session.LastError ?? "The run stopped. Update credentials below or click Analyze ticket again.")</div>
+    </div>
+}
+@if (_session?.State == AgentState.Authenticating)
+{
+    <div class="banner">
+        <strong>Signing in to @(_session.Context.SelectedEnvironmentDisplayName ?? "the environment")…</strong>
+        <div class="muted">Opening @(EnvironmentUrlSanitizer.StripCredentials(_session.Context.EnvironmentUrl)) in an isolated browser and verifying the login. Reproduction starts only after a successful sign-in.</div>
     </div>
 }
 @if (!string.IsNullOrWhiteSpace(_session?.LastError) && _session.State is not AgentState.Blocked and not AgentState.Failed)
@@ -93,7 +103,8 @@
                 {
                     var effective = _session.State switch
                     {
-                        AgentState.ReadyToReproduce or AgentState.ConnectingEnvironment => AgentState.Reproducing,
+                        AgentState.ReadyToReproduce => AgentState.Authenticating,
+                        AgentState.ConnectingEnvironment => AgentState.Reproducing,
                         AgentState.FixProposed => AgentState.AwaitingApproval,
                         AgentState.Blocked or AgentState.Failed => AgentState.AwaitingMissingInfo,
                         _ => _session.State
@@ -107,31 +118,98 @@
                  && _session.Context.MissingFields.Count > 0)
             {
                 <h3>Next step — provide this to continue</h3>
-                <p class="muted">Portal login (not Atlassian). Enter the <strong>environment URL</strong> you want tested, then username/password. Click Continue to retry reproduce.</p>
+                <p class="muted">Choose the <strong>environment</strong> to investigate and sign in with that environment's own account (not Atlassian). Credentials are never reused for a different environment.</p>
                 @foreach (var field in _session.Context.MissingFields)
                 {
                     <div class="field">
                         <label>@field.Label</label>
                         <div class="muted" style="margin-bottom:0.35rem">@field.Reason</div>
-                        @if (field.Key == "credentials")
+                        @if (field.InputType == "environment")
                         {
-                            <div class="field">
-                                <label>Existing profile</label>
-                                <select @bind="_selectedProfileId">
-                                    <option value="">— enter new credentials —</option>
-                                    @foreach (var p in _profiles)
-                                    {
-                                        <option value="@p.Id">@p.Label</option>
-                                    }
-                                </select>
-                            </div>
-                            @if (string.IsNullOrWhiteSpace(_selectedProfileId))
+                            var envs = EnvironmentSelection.ListForApplication(_session.Context.ApplicationId);
+                            <select @bind="_selectedEnvironmentId" @bind:after="OnEnvironmentChangedAsync" aria-label="Environment" disabled="@_submitting">
+                                <option value="">— select environment —</option>
+                                @foreach (var group in envs.GroupBy(e => e.ApplicationId ?? "Other applications"))
+                                {
+                                    <optgroup label="@group.Key">
+                                        @foreach (var env in group)
+                                        {
+                                            var check = EnvironmentSelection.Validate(env.Id);
+                                            <option value="@env.Id" disabled="@(!check.IsValid)">
+                                                @env.DisplayName (@env.Type)@(EnvironmentSuffix(env, check))@(string.Equals(env.Id, _session.Context.SuggestedEnvironmentId, StringComparison.OrdinalIgnoreCase) ? " — suggested" : "")
+                                            </option>
+                                        }
+                                    </optgroup>
+                                }
+                                @if (EnvironmentSelection.Registry.AllowAdHocUrl)
+                                {
+                                    <option value="@EnvironmentSelectionService.AdHocOptionId">Other — enter URL manually</option>
+                                }
+                            </select>
+                            @if (envs.Count == 0)
                             {
-                                <div class="field"><label>Username</label><input @bind="_credUser" autocomplete="username" placeholder="@(_session.Context.Username ?? "application username")" /></div>
-                                <div class="field"><label>Password</label><input type="password" @bind="_credPassword" autocomplete="current-password" /></div>
-                                <div class="field"><label>Token (optional)</label><input type="password" @bind="_credToken" /></div>
-                                <label><input type="checkbox" @bind="_saveProfile" /> Save credential profile for reuse</label>
+                                <div class="banner warn" style="margin-top:0.5rem">No environments are registered. Add them under <code>EnvironmentRegistry:Environments</code> (see appsettings.Local.sample.json).</div>
                             }
+                            @if (_selectedEnvironmentId == EnvironmentSelectionService.AdHocOptionId)
+                            {
+                                <input @bind="_adHocUrl" placeholder="https://your-portal.azurewebsites.net" style="width:100%;margin-top:0.5rem" aria-label="Environment URL" />
+                            }
+                            else if (_selectedEnvironment is { } selEnv)
+                            {
+                                <dl class="kv" style="margin-top:0.5rem">
+                                    <dt>Type</dt><dd>@selEnv.Type @(selEnv.IsProduction ? "(read-only)" : "")</dd>
+                                    <dt>URL</dt><dd>@(selEnv.SafeBaseUrl ?? "— not configured —")</dd>
+                                    @foreach (var meta in selEnv.Metadata)
+                                    {
+                                        <dt>@meta.Key</dt><dd>@meta.Value</dd>
+                                    }
+                                </dl>
+                            }
+                            @if (_selectedEnvironmentError is not null)
+                            {
+                                <div class="banner warn" style="margin-top:0.5rem">@_selectedEnvironmentError</div>
+                            }
+                            @if (_selectedEnvironment?.IsProduction == true)
+                            {
+                                <div class="banner warn" style="margin-top:0.5rem">
+                                    <strong>Production environment — read-only investigation.</strong>
+                                    The agent will not create, modify, submit or delete data and will skip steps that could.
+                                    <div style="margin-top:0.4rem">
+                                        <label><input type="checkbox" @bind="_allowStateChanging" /> I explicitly allow potentially state-changing steps on Production for this investigation</label>
+                                    </div>
+                                </div>
+                            }
+                        }
+                        else if (field.InputType == "credentials")
+                        {
+                            @if (_selectedEnvironment is null && _selectedEnvironmentId != EnvironmentSelectionService.AdHocOptionId)
+                            {
+                                <div class="muted">Select an environment first.</div>
+                            }
+                            else
+                            {
+                                @if (_savedProfile is not null)
+                                {
+                                    <div class="field">
+                                        <label><input type="radio" name="credMode" checked="@_useSavedProfile" @onchange="() => _useSavedProfile = true" /> Use saved credentials for <strong>@_savedProfile.Username</strong></label>
+                                        <label><input type="radio" name="credMode" checked="@(!_useSavedProfile)" @onchange="() => _useSavedProfile = false" /> Enter different credentials for this investigation</label>
+                                    </div>
+                                }
+                                @if (_savedProfile is null || !_useSavedProfile)
+                                {
+                                    <div class="field"><label for="envUser">Username</label><input id="envUser" @bind="_credUser" autocomplete="username" placeholder="@(_session.Context.Username ?? "application username")" disabled="@_submitting" /></div>
+                                    <div class="field"><label for="envPassword">Password</label><input id="envPassword" type="password" @bind="_credPassword" autocomplete="current-password" disabled="@_submitting" /></div>
+                                    <label><input type="checkbox" @bind="_saveProfile" disabled="@_submitting" /> Remember credentials securely for @(_selectedEnvironment?.DisplayName ?? "this environment") (encrypted on this machine, only for you)</label>
+                                    <div class="muted">Not checked: the password is kept in memory for this investigation only and discarded after sign-in.</div>
+                                }
+                            }
+                        }
+                        else if (field.InputType == "auth-manual")
+                        {
+                            <div class="btn-row">
+                                <button class="btn" disabled="@_submitting" @onclick='() => SubmitAuthActionAsync("recheck")'>I completed it — re-check sign-in</button>
+                                <button class="btn secondary" disabled="@_submitting" @onclick='() => SubmitAuthActionAsync("restart")'>Use other credentials / environment</button>
+                            </div>
                         }
                         else if (field.InputType == "settings-link" || field.Key == "jiraSettings")
                         {
@@ -149,21 +227,22 @@
                         {
                             <input @bind="_missingValues[field.Key]" placeholder="C:\path\to\local\repo" />
                         }
-                        else if (field.Key == "environmentUrl")
-                        {
-                            <input @bind="_missingValues[field.Key]"
-                                   placeholder="https://your-portal.azurewebsites.net"
-                                   style="width:100%" />
-                        }
                         else
                         {
                             <input @bind="_missingValues[field.Key]" />
                         }
                     </div>
                 }
-                <div class="btn-row">
-                    <button class="btn" @onclick="SubmitMissingAsync">Continue</button>
-                </div>
+                @if (!string.IsNullOrWhiteSpace(_validationMessage))
+                {
+                    <div class="banner warn" role="alert">@_validationMessage</div>
+                }
+                @if (_session.Context.MissingFields.Any(f => f.InputType != "auth-manual"))
+                {
+                    <div class="btn-row">
+                        <button class="btn" disabled="@_submitting" @onclick="SubmitMissingAsync">@(_submitting ? "Submitting…" : "Continue")</button>
+                    </div>
+                }
             }
             else if (_session.State == AgentState.AwaitingMissingInfo)
             {
@@ -177,8 +256,42 @@
                 <dt>Ticket</dt><dd>@_session.Context.JiraTicketKey</dd>
                 <dt>Summary</dt><dd>@(_session.Context.Summary ?? "—")</dd>
                 <dt>Fix version</dt><dd>@(_session.Context.FixVersion ?? "—")</dd>
-                <dt>Environment</dt><dd>@(_session.Context.EnvironmentName ?? "—")</dd>
-                <dt>URL</dt><dd>@(_session.Context.EnvironmentUrl ?? "—")</dd>
+                <dt>Investigation</dt><dd>@_session.Context.InvestigationId.ToString("N")[..8]</dd>
+                <dt>Environment</dt>
+                <dd>
+                    @if (_session.Context.EnvironmentSelectionConfirmed && _session.Context.SelectedEnvironmentDisplayName is not null)
+                    {
+                        <strong>@_session.Context.SelectedEnvironmentDisplayName</strong>
+                        <span class="muted"> (@_session.Context.SelectedEnvironmentType@(_session.Context.IsReadOnlyEnvironment ? ", read-only" : ""))</span>
+                    }
+                    else if (_session.Context.SuggestedEnvironmentId is not null)
+                    {
+                        <span>Suggested: @_session.Context.SuggestedEnvironmentId</span>
+                        <span class="muted"> — awaiting your confirmation</span>
+                    }
+                    else
+                    {
+                        <span>@(_session.Context.EnvironmentName ?? "— not selected —")</span>
+                    }
+                </dd>
+                <dt>URL</dt><dd>@(EnvironmentUrlSanitizer.StripCredentials(_session.Context.EnvironmentUrl) ?? "—")</dd>
+                <dt>Sign-in</dt>
+                <dd>
+                    <span class="auth-status auth-@_session.Context.AuthenticationStatus.ToString().ToLowerInvariant()">@AuthenticationStatusDisplay.Label(_session.Context.AuthenticationStatus)</span>
+                    @if (!string.IsNullOrWhiteSpace(_session.Context.AuthenticationMessage)
+                         && _session.Context.AuthenticationStatus is not AuthenticationStatus.NotStarted)
+                    {
+                        <div class="muted">@_session.Context.AuthenticationMessage</div>
+                    }
+                </dd>
+                @if (!string.IsNullOrWhiteSpace(_session.Context.FixPullRequestUrl))
+                {
+                    <dt>Fix PR (not portal)</dt>
+                    <dd>
+                        <a href="@_session.Context.FixPullRequestUrl" target="_blank" rel="noopener">@_session.Context.FixPullRequestUrl</a>
+                        <div class="muted">Linked on the ticket as a fix reference — agent will not open this for login.</div>
+                    </dd>
+                }
                 <dt>User / role</dt><dd>@($"{_session.Context.Username ?? "—"} / {_session.Context.Role ?? "—"}")</dd>
                 <dt>Steps</dt><dd>@_session.Context.ReproductionSteps.Count</dd>
                 <dt>Reproduction</dt><dd>@_session.Context.ReproductionOutcome</dd>
@@ -386,6 +499,10 @@
                             <figure class="evidence-card">
                                 <figcaption>
                                     @(FriendlyShotCaption(e.Caption) ?? "Screenshot")
+                                    @if (!string.IsNullOrWhiteSpace(e.EnvironmentName) || !string.IsNullOrWhiteSpace(e.Category))
+                                    {
+                                        <div class="muted" style="font-size:0.75rem">@e.JiraTicketKey · @e.EnvironmentName@(string.IsNullOrWhiteSpace(e.Category) ? "" : $" · {e.Category}")</div>
+                                    }
                                     <button class="btn secondary" style="padding:0.2rem 0.55rem;font-size:0.75rem;margin-left:0.5rem" @onclick="() => DeleteOneEvidenceAsync(e)">Delete</button>
                                 </figcaption>
                                 @if (url is not null)
@@ -438,6 +555,7 @@
         AgentState.RetrievingDocs,
         AgentState.ExtractingContext,
         AgentState.AwaitingMissingInfo,
+        AgentState.Authenticating,
         AgentState.Reproducing,
         AgentState.Investigating,
         AgentState.AwaitingApproval,
@@ -453,15 +571,25 @@
     private bool _jiraReady;
     private AgentSession? _session;
     private Dictionary<string, string> _missingValues = new(StringComparer.OrdinalIgnoreCase);
-    private List<CredentialProfile> _profiles = new();
-    private string _selectedProfileId = "";
     private string _credUser = "";
     private string _credPassword = "";
-    private string _credToken = "";
-    private bool _saveProfile = true;
+    // Default: credentials are used for this investigation only. Persisting requires an explicit opt-in.
+    private bool _saveProfile;
     private string _lessonText = "";
     private MemoryScope _lessonScope = MemoryScope.Repository;
     private string _evidenceActionMessage = "";
+
+    // Environment selection / credential form state
+    private string _selectedEnvironmentId = "";
+    private AppEnvironment? _selectedEnvironment;
+    private string? _selectedEnvironmentError;
+    private string _adHocUrl = "";
+    private bool _allowStateChanging;
+    private CredentialProfile? _savedProfile;
+    private bool _useSavedProfile;
+    private bool _submitting;
+    private string? _validationMessage;
+    private bool _environmentPrefilled;
 
     protected override void OnInitialized()
     {
@@ -481,13 +609,21 @@
         try
         {
             Detach();
+            ClearCredentialInputs();
+            _selectedEnvironmentId = "";
+            _selectedEnvironment = null;
+            _selectedEnvironmentError = null;
+            _adHocUrl = "";
+            _allowStateChanging = false;
+            _savedProfile = null;
+            _useSavedProfile = false;
+            _saveProfile = false;
+            _validationMessage = null;
+            _environmentPrefilled = false;
             _session = Sessions.Create();
             _session.Changed += OnSessionChanged;
             _missingValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             await Orchestrator.StartAsync(_session.Id, _jiraInput.Trim(), string.IsNullOrWhiteSpace(_workspacePath) ? null : _workspacePath.Trim());
-            _profiles = (await CredentialVault.ListProfilesAsync()).ToList();
-            if (!string.IsNullOrWhiteSpace(_session.Context.Username))
-                _credUser = _session.Context.Username;
         }
         finally
         {
@@ -495,35 +631,153 @@
         }
     }
 
+    private async Task OnEnvironmentChangedAsync()
+    {
+        _validationMessage = null;
+        _selectedEnvironment = null;
+        _selectedEnvironmentError = null;
+        _savedProfile = null;
+        _useSavedProfile = false;
+        _allowStateChanging = false;
+
+        if (string.IsNullOrWhiteSpace(_selectedEnvironmentId))
+            return;
+
+        if (_selectedEnvironmentId == EnvironmentSelectionService.AdHocOptionId)
+        {
+            if (string.IsNullOrWhiteSpace(_adHocUrl))
+                _adHocUrl = _session?.Context.SuggestedAdHocUrl ?? "";
+            return;
+        }
+
+        var check = EnvironmentSelection.Validate(_selectedEnvironmentId);
+        _selectedEnvironment = check.Environment ?? EnvironmentSelection.Registry.Get(_selectedEnvironmentId);
+        _selectedEnvironmentError = check.IsValid ? null : check.Error;
+        if (check.IsValid && check.Environment is not null)
+        {
+            _savedProfile = await CredentialVault.FindForEnvironmentAsync(check.Environment.Id);
+            _useSavedProfile = _savedProfile is not null;
+            if (_savedProfile is not null)
+                _credUser = _savedProfile.Username ?? _credUser;
+        }
+    }
+
     private async Task SubmitMissingAsync()
     {
-        if (_session is null)
+        if (_session is null || _submitting)
             return;
+
+        _validationMessage = null;
+        var fields = _session.Context.MissingFields;
+        var needsEnvironment = fields.Any(f => f.InputType == "environment");
+        var needsCredentials = fields.Any(f => f.InputType == "credentials");
+
+        // Client-side validation (the orchestrator validates again).
+        if (needsEnvironment && string.IsNullOrWhiteSpace(_selectedEnvironmentId))
+        {
+            _validationMessage = "Select the environment on which the bug should be investigated.";
+            return;
+        }
+        if (needsEnvironment && _selectedEnvironmentId == EnvironmentSelectionService.AdHocOptionId && string.IsNullOrWhiteSpace(_adHocUrl))
+        {
+            _validationMessage = "Enter the environment URL.";
+            return;
+        }
+        if (needsEnvironment && _selectedEnvironmentError is not null)
+        {
+            _validationMessage = _selectedEnvironmentError;
+            return;
+        }
+
+        var useSaved = needsCredentials && _savedProfile is not null && _useSavedProfile;
+        if (needsCredentials && !useSaved)
+        {
+            if (string.IsNullOrWhiteSpace(_credUser))
+            {
+                _validationMessage = "Enter the username for the selected environment.";
+                return;
+            }
+            if (string.IsNullOrEmpty(_credPassword))
+            {
+                _validationMessage = "Enter the password for the selected environment.";
+                return;
+            }
+        }
 
         var values = new Dictionary<string, string>(_missingValues, StringComparer.OrdinalIgnoreCase);
         // Prefer explicit missing-field workspace over the start form when both are set.
         if (!values.ContainsKey("workspacePath") && !string.IsNullOrWhiteSpace(_workspacePath))
             values["workspacePath"] = _workspacePath;
 
-        CredentialSecret? secret = null;
-        if (!string.IsNullOrWhiteSpace(_selectedProfileId) && Guid.TryParse(_selectedProfileId, out var profileId))
+        if (!string.IsNullOrWhiteSpace(_selectedEnvironmentId))
         {
-            values["credentialProfileId"] = profileId.ToString();
+            values["environmentId"] = _selectedEnvironmentId;
+            if (_selectedEnvironmentId == EnvironmentSelectionService.AdHocOptionId)
+                values["environmentUrl"] = _adHocUrl.Trim();
         }
-        else if (_session.Context.MissingFields.Any(f => f.Key == "credentials"))
+        if (_selectedEnvironment?.IsProduction == true)
+            values["allowStateChangingActions"] = _allowStateChanging ? "true" : "false";
+
+        CredentialSecret? secret = null;
+        if (useSaved)
         {
-            secret = new CredentialSecret
-            {
-                Username = string.IsNullOrWhiteSpace(_credUser) ? (_session.Context.Username ?? "user") : _credUser,
-                Password = _credPassword,
-                Token = string.IsNullOrWhiteSpace(_credToken) ? null : _credToken
-            };
+            values["credentialProfileId"] = _savedProfile!.Id.ToString();
+        }
+        else if (needsCredentials)
+        {
+            secret = new CredentialSecret { Username = _credUser.Trim(), Password = _credPassword };
         }
 
-        await Orchestrator.SubmitMissingInfoAsync(_session.Id, values, secret, _saveProfile);
+        _submitting = true;
+        try
+        {
+            await Orchestrator.SubmitMissingInfoAsync(_session.Id, values, secret, _saveProfile && secret is not null);
+        }
+        finally
+        {
+            // Never keep the typed password in the component after it was handed to the orchestrator.
+            secret = null;
+            _credPassword = "";
+            _saveProfile = false;
+            _submitting = false;
+        }
+
         StateHasChanged();
     }
 
+    private async Task SubmitAuthActionAsync(string action)
+    {
+        if (_session is null || _submitting)
+            return;
+        _submitting = true;
+        try
+        {
+            await Orchestrator.SubmitMissingInfoAsync(
+                _session.Id,
+                new Dictionary<string, string> { ["authAction"] = action },
+                null,
+                false);
+        }
+        finally
+        {
+            _submitting = false;
+        }
+        StateHasChanged();
+    }
+
+    private void ClearCredentialInputs()
+    {
+        _credUser = "";
+        _credPassword = "";
+    }
+
+    private static string EnvironmentSuffix(AppEnvironment env, EnvironmentValidationResult check)
+    {
+        if (!env.Enabled) return " — disabled";
+        if (string.IsNullOrWhiteSpace(env.BaseUrl)) return " — URL not configured";
+        if (!check.IsValid) return " — unavailable";
+        return "";
+    }
     private async Task ApproveAsync(bool approve)
     {
         if (_session is null) return;
@@ -599,21 +853,44 @@
 
     private void OnSessionChanged()
     {
-        if (_session?.Context.MissingFields is { Count: > 0 } fields)
+        _ = InvokeAsync(async () =>
         {
-            foreach (var f in fields)
+            if (_session?.Context.MissingFields is { Count: > 0 } fields)
             {
-                if (!_missingValues.ContainsKey(f.Key) && f.Key != "credentials")
+                foreach (var f in fields)
                 {
-                    if (f.Key == "environmentUrl" &&
-                        EnvironmentUrlParser.IsLikelyPortalEnvironmentUrl(_session.Context.EnvironmentUrl))
-                        _missingValues[f.Key] = _session.Context.EnvironmentUrl!;
-                    else
+                    if (f.InputType is "environment" or "credentials" or "auth-manual")
+                        continue;
+                    if (!_missingValues.ContainsKey(f.Key))
                         _missingValues[f.Key] = "";
                 }
+
+                // Preselect the confirmed environment, else the suggestion inferred from the ticket — the user can change it.
+                if (fields.Any(f => f.InputType == "environment") && !_environmentPrefilled)
+                {
+                    var ctx = _session.Context;
+                    var preselect = ctx.SelectedEnvironmentId is { } sel && sel.StartsWith(AppEnvironment.AdHocPrefix, StringComparison.OrdinalIgnoreCase)
+                        ? EnvironmentSelectionService.AdHocOptionId
+                        : ctx.SelectedEnvironmentId ?? ctx.SuggestedEnvironmentId;
+                    if (!string.IsNullOrWhiteSpace(preselect))
+                    {
+                        _environmentPrefilled = true;
+                        _selectedEnvironmentId = preselect;
+                        if (preselect == EnvironmentSelectionService.AdHocOptionId)
+                            _adHocUrl = ctx.EnvironmentUrl ?? ctx.SuggestedAdHocUrl ?? "";
+                        await OnEnvironmentChangedAsync();
+                    }
+                    if (string.IsNullOrWhiteSpace(_credUser) && !string.IsNullOrWhiteSpace(ctx.Username))
+                        _credUser = ctx.Username!;
+                }
             }
-        }
-        _ = InvokeAsync(StateHasChanged);
+            else
+            {
+                _environmentPrefilled = false;
+            }
+
+            StateHasChanged();
+        });
     }
 
     private void Detach()
@@ -629,7 +906,8 @@
         // Map intermediate / terminal states onto the visible pipeline for progress chips.
         var effective = current switch
         {
-            AgentState.ReadyToReproduce or AgentState.ConnectingEnvironment => AgentState.Reproducing,
+            AgentState.ReadyToReproduce => AgentState.Authenticating,
+            AgentState.ConnectingEnvironment => AgentState.Reproducing,
             AgentState.FixProposed => AgentState.AwaitingApproval,
             AgentState.Blocked or AgentState.Failed => AgentState.AwaitingMissingInfo,
             _ => current

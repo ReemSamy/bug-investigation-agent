@@ -153,3 +153,15 @@ textarea { min-height: 90px; resize: vertical; }
   display: none; left: 0; padding: 0.6rem 1.25rem; position: fixed; width: 100%; z-index: 1000; color: white;
 }
 #blazor-error-ui .dismiss { cursor: pointer; position: absolute; right: 0.75rem; top: 0.5rem; }
+
+/* Environment sign-in status */
+.auth-status { font-weight: 600; }
+.auth-status.auth-succeeded { color: var(--accent-2); }
+.auth-status.auth-inprogress { color: var(--accent); }
+.auth-status.auth-invalidcredentials,
+.auth-status.auth-failed,
+.auth-status.auth-sessionexpired { color: var(--danger); }
+.auth-status.auth-mfarequired,
+.auth-status.auth-manualinterventionrequired,
+.auth-status.auth-credentialsrequired { color: #e3a008; }
+select optgroup { font-weight: 700; }

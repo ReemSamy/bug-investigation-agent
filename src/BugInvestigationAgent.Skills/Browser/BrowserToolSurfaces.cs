@@ -56,7 +56,12 @@ public sealed class DeterministicPlaywrightBrowserSurface : IBrowserToolSurface
     {
         var page = RequirePage();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        await page.ScreenshotAsync(new PageScreenshotOptions { Path = path, FullPage = true });
+        await page.ScreenshotAsync(new PageScreenshotOptions
+        {
+            Path = path,
+            FullPage = true,
+            Mask = Evidence.EvidenceScreenshots.MaskSelectors(null).Select(s => page.Locator(s)).ToArray()
+        });
         return path;
     }
 

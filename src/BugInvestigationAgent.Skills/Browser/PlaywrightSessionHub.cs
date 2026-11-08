@@ -12,20 +12,31 @@ public interface IPlaywrightSessionHub : IBrowserSessionCloser
     bool TryGetPage(Guid sessionId, out IPage page);
 }
 
+/// <remarks>
+/// Each <see cref="IPlaywrightSessionHub.StartAsync"/> launches a fresh browser with a new, empty
+/// <see cref="IBrowserContext"/> (no cookies/storage), so authenticated state is isolated per investigation and per
+/// environment attempt and is never shared across users or environments. Closing discards the session entirely.
+/// </remarks>
 public sealed class PlaywrightSessionHub : IPlaywrightSessionHub, IAsyncDisposable
 {
     private readonly object _gate = new();
     private readonly Dictionary<Guid, SessionEntry> _sessions = new();
+    private readonly bool _headless;
+
+    public PlaywrightSessionHub(Microsoft.Extensions.Options.IOptions<BugInvestigationAgent.Core.Configuration.AgentOptions>? options = null) =>
+        _headless = options?.Value.Browser.Headless ?? true;
 
     public async Task<IPage> StartAsync(Guid sessionId, CancellationToken cancellationToken = default)
     {
         await CloseAsync(sessionId);
 
         var playwright = await Playwright.CreateAsync();
-        var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions { Headless = true });
+        var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions { Headless = _headless });
         var context = await browser.NewContextAsync(new BrowserNewContextOptions
         {
-            ViewportSize = new ViewportSize { Width = 1440, Height = 900 }
+            ViewportSize = new ViewportSize { Width = 1440, Height = 900 },
+            // Do not let the browser offer to save the password or reuse anything from a profile.
+            AcceptDownloads = false
         });
         var page = await context.NewPageAsync();
 

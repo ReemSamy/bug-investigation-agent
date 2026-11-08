@@ -26,9 +26,13 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient("jira-test");
         services.AddTransient<JiraConnectionTester>();
 
-        services.AddDataProtection()
+        var dataProtection = services.AddDataProtection()
             .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(contentRoot, "App_Data", "keys")))
             .SetApplicationName("BugInvestigationAgent");
+        // Encrypt the key ring at rest with the Windows user's DPAPI key, so copying App_Data alone
+        // (or another Windows account) cannot decrypt saved credentials.
+        if (OperatingSystem.IsWindows())
+            dataProtection.ProtectKeysWithDpapi();
 
         services.AddDbContext<AgentDbContext>((sp, options) =>
         {
@@ -41,6 +45,7 @@ public static class ServiceCollectionExtensions
             options.UseSqlite($"Data Source={dbPath}");
         });
 
+        services.AddSingleton<ICurrentUserAccessor, LocalCurrentUserAccessor>();
         services.AddScoped<ICredentialVault, DataProtectionCredentialVault>();
         services.AddScoped<IEngineeringMemoryStore, EfEngineeringMemoryStore>();
         services.AddSingleton<MarkdownKnowledgeStore>();
@@ -63,6 +68,7 @@ internal sealed class DatabaseInitializer : IHostedService
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AgentDbContext>();
         await db.Database.EnsureCreatedAsync(cancellationToken);
+        await SchemaUpgrader.UpgradeAsync(db, cancellationToken);
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;

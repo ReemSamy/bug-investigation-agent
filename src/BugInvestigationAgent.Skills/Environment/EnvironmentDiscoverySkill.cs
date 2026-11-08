@@ -1,12 +1,18 @@
 using System.Text.RegularExpressions;
 using BugInvestigationAgent.Core.Context;
+using BugInvestigationAgent.Core.Environments;
 using BugInvestigationAgent.Core.Permissions;
 using BugInvestigationAgent.Core.Skills;
+using BugInvestigationAgent.Skills.Jira;
 
 namespace BugInvestigationAgent.Skills.Environment;
 
 public sealed class EnvironmentDiscoverySkill : ISkill
 {
+    private readonly IEnvironmentSelectionService? _environments;
+
+    public EnvironmentDiscoverySkill(IEnvironmentSelectionService? environments = null) => _environments = environments;
+
     public string SkillId => SkillIds.EnvironmentDiscovery;
     public string DisplayName => "Environment Discovery";
     public AgentPermission RequiredPermissions => AgentPermission.ReadJira;
@@ -67,6 +73,19 @@ public sealed class EnvironmentDiscoverySkill : ISkill
 
         request.Progress?.Report(
             $"Extracted system={ctx.SystemName ?? "?"}, env={ctx.EnvironmentName ?? "?"}, user={ctx.Username ?? ctx.Role ?? "?"}, url={(ctx.EnvironmentUrl is null ? "missing" : "found")}.");
+
+        // Also surface fix PRs found only in comments/custom fields after Jira load.
+        if (string.IsNullOrWhiteSpace(ctx.FixPullRequestUrl))
+            JiraSkill.CaptureFixPullRequestReference(ctx, request.Progress);
+
+        // Match the ticket against the environment registry. This is only a suggestion — the user confirms or changes it.
+        if (_environments is not null)
+        {
+            var suggestion = _environments.ApplySuggestion(ctx);
+            request.Progress?.Report(suggestion.EnvironmentId is null
+                ? $"Environment not identified from the ticket: {suggestion.Reason}"
+                : $"Suggested environment: {suggestion.EnvironmentId} — {suggestion.Reason}");
+        }
 
         return Task.FromResult(SkillResult.Ok("Environment discovery complete."));
     }

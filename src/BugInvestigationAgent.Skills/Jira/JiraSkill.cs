@@ -144,6 +144,8 @@ public sealed class JiraSkill : ISkill
                 _logger.LogDebug(ex, "Failed to load comments for {Key}", key);
             }
 
+            CaptureFixPullRequestReference(request.Context, request.Progress);
+
             return SkillResult.Ok($"Loaded Jira issue {key}.");
         }
         catch (Exception ex)
@@ -372,5 +374,28 @@ public sealed class JiraSkill : ISkill
             progress?.Report($"Downloaded {downloaded} Jira screenshot attachment(s) as reproduction references.");
             context.CustomFields["jiraAttachmentImages"] = downloaded.ToString();
         }
+    }
+
+    /// <summary>
+    /// If the ticket/comments link an Azure DevOps or GitHub PR, record it as a fix reference —
+    /// never as the portal EnvironmentUrl.
+    /// </summary>
+    internal static void CaptureFixPullRequestReference(RuntimeContext context, IProgress<string>? progress = null)
+    {
+        var corpus = string.Join('\n',
+            new[] { context.Description, context.Summary }
+                .Concat(context.Comments)
+                .Concat(context.CustomFields.Values)
+                .Where(s => !string.IsNullOrWhiteSpace(s)));
+
+        var pr = EnvironmentUrlParser.FindFixPullRequestUrl(corpus);
+        if (string.IsNullOrWhiteSpace(pr))
+            return;
+
+        context.FixPullRequestUrl = pr;
+        context.CustomFields["fixPullRequestUrl"] = pr;
+        progress?.Report(
+            $"Ticket references a fix PR (not the portal): {pr}. " +
+            "Ask for the environment URL where that fix may already be deployed, then try to reproduce there.");
     }
 }

@@ -15,6 +15,10 @@ public static class ServiceCollectionExtensions
     {
         services.AddSingleton<IAgentSessionStore, InMemoryAgentSessionStore>();
         services.AddSingleton<ISecretRedactor, SecretRedactor>();
+        services.AddOptions<Environments.EnvironmentRegistryOptions>();
+        services.AddSingleton<Environments.IEnvironmentRegistry, Environments.ConfigurationEnvironmentRegistry>();
+        services.AddSingleton<Environments.IEnvironmentSelectionService, Environments.EnvironmentSelectionService>();
+        services.AddSingleton<Credentials.ISessionCredentialStore, Credentials.InMemorySessionCredentialStore>();
         services.AddSingleton<IMissingInfoResolver, MissingInfoResolver>();
         services.AddSingleton<IRulesProvider, DefaultRulesProvider>();
         services.AddSingleton<IAgentRuntimeResolver, AgentRuntimeResolver>();

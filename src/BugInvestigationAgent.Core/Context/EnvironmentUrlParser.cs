@@ -117,6 +117,39 @@ public static class EnvironmentUrlParser
         return host.Contains('.', StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Finds a pull-request / merge-request URL in ticket text (ADO, GitHub, etc.).
+    /// These are fix references — never portal login targets.
+    /// </summary>
+    public static string? FindFixPullRequestUrl(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        foreach (Match m in Regex.Matches(text, @"https?://[^\s\)\]\>""']+", RegexOptions.IgnoreCase))
+        {
+            var url = m.Value.TrimEnd('.', ',', ';', ')');
+            if (IsFixPullRequestUrl(url))
+                return url;
+        }
+
+        return null;
+    }
+
+    public static bool IsFixPullRequestUrl(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+        if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri))
+            return false;
+
+        var path = uri.PathAndQuery;
+        return path.Contains("/pullrequest/", StringComparison.OrdinalIgnoreCase)
+               || path.Contains("/pull/", StringComparison.OrdinalIgnoreCase)
+               || path.Contains("/merge_requests/", StringComparison.OrdinalIgnoreCase)
+               || Regex.IsMatch(path, @"/pulls?/\d+", RegexOptions.IgnoreCase);
+    }
+
     private static IEnumerable<string> EnumerateRawUrls(string text)
     {
         foreach (Match m in Regex.Matches(text, @"https?://[^\s\)\]\>""']+", RegexOptions.IgnoreCase))

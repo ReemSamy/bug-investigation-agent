@@ -1,35 +1,54 @@
+using BugInvestigationAgent.Core.Authentication;
 using BugInvestigationAgent.Core.Configuration;
 using BugInvestigationAgent.Core.Context;
 using BugInvestigationAgent.Core.Credentials;
+using BugInvestigationAgent.Core.Environments;
 using BugInvestigationAgent.Core.Permissions;
 using BugInvestigationAgent.Core.Security;
 using BugInvestigationAgent.Core.Skills;
 using BugInvestigationAgent.Core.Workflow;
+using BugInvestigationAgent.Skills.Browser.Authentication;
+using BugInvestigationAgent.Skills.Evidence;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.Playwright;
 
 namespace BugInvestigationAgent.Skills.Browser;
 
+/// <summary>
+/// Opens the selected environment in an isolated browser session and signs in with the environment-specific
+/// credentials. Sets <see cref="RuntimeContext.AuthenticationStatus"/>; the orchestrator only starts reproduction
+/// when it is <see cref="AuthenticationStatus.Succeeded"/>.
+/// Inputs: mode=login (default) | recheck (re-evaluate the open page after a manual/MFA step).
+/// </summary>
 public sealed class BrowserAutomationSkill : ISkill
 {
     private readonly ICredentialVault _vault;
+    private readonly ISessionCredentialStore _sessionCredentials;
+    private readonly IEnvironmentSelectionService _environments;
     private readonly ISecretRedactor _redactor;
     private readonly AgentOptions _options;
     private readonly IPlaywrightSessionHub _sessions;
+    private readonly LoginFlow _loginFlow;
     private readonly ILogger<BrowserAutomationSkill> _logger;
 
     public BrowserAutomationSkill(
         ICredentialVault vault,
+        ISessionCredentialStore sessionCredentials,
+        IEnvironmentSelectionService environments,
         ISecretRedactor redactor,
         IOptions<AgentOptions> options,
         IPlaywrightSessionHub sessions,
+        LoginFlow loginFlow,
         ILogger<BrowserAutomationSkill> logger)
     {
         _vault = vault;
+        _sessionCredentials = sessionCredentials;
+        _environments = environments;
         _redactor = redactor;
         _options = options.Value;
         _sessions = sessions;
+        _loginFlow = loginFlow;
         _logger = logger;
     }
 
@@ -43,167 +62,204 @@ public sealed class BrowserAutomationSkill : ISkill
     public async Task<SkillResult> ExecuteAsync(SkillExecutionRequest request, CancellationToken cancellationToken = default)
     {
         var ctx = request.Context;
-        if (string.IsNullOrWhiteSpace(ctx.EnvironmentUrl))
+        var recheck = request.Inputs is not null
+                      && request.Inputs.TryGetValue("mode", out var mode)
+                      && string.Equals(mode, "recheck", StringComparison.OrdinalIgnoreCase);
+
+        // 1) Environment must be selected, enabled and have a URL — otherwise never open a browser.
+        var validation = string.IsNullOrWhiteSpace(ctx.SelectedEnvironmentId)
+            ? EnvironmentValidationResult.Fail("No environment selected. Select the environment to investigate.")
+            : ctx.SelectedEnvironmentId!.StartsWith(AppEnvironment.AdHocPrefix, StringComparison.OrdinalIgnoreCase)
+                ? _environments.Validate(EnvironmentSelectionService.AdHocOptionId, ctx.EnvironmentUrl)
+                : _environments.Validate(ctx.SelectedEnvironmentId);
+        if (!validation.IsValid || validation.Environment is null)
         {
-            ctx.ReproductionOutcome = ReproductionOutcome.Blocked;
-            ctx.ReproductionNotes = "Environment URL is required before browser automation.";
-            return SkillResult.Ok(ctx.ReproductionNotes);
+            return Stop(ctx, ReproductionOutcome.Blocked, AuthenticationStatus.NotStarted,
+                validation.Error ?? "The selected environment is not available.");
         }
 
-        if (ctx.CredentialProfileId is null)
+        var env = validation.Environment;
+        ctx.EnvironmentUrl = env.BaseUrl;
+
+        if (recheck && _sessions.TryGetPage(ctx.InvestigationId, out var openPage))
+            return await RecheckAsync(ctx, env, openPage, request.Progress, cancellationToken);
+
+        // 2) Environment-specific credentials: typed for this investigation (default), or an opted-in saved profile.
+        CredentialSecret? secret = null;
+        if (env.Login.RequiresLogin)
         {
-            ctx.ReproductionOutcome = ReproductionOutcome.Blocked;
-            ctx.ReproductionNotes = "Environment login credentials are required before opening the portal.";
-            return SkillResult.Ok(ctx.ReproductionNotes);
+            secret = _sessionCredentials.Take(ctx.InvestigationId, env.Id);
+            if (secret is null && ctx.CredentialProfileId is Guid profileId)
+            {
+                var profile = await _vault.GetProfileAsync(profileId, cancellationToken);
+                if (profile is not null && !profile.IsLegacyUnscoped &&
+                    string.Equals(profile.EnvironmentId, env.Id, StringComparison.OrdinalIgnoreCase))
+                    secret = await _vault.ResolveSecretAsync(profileId, cancellationToken);
+                if (secret is null)
+                    ctx.CredentialProfileId = null;
+            }
+
+            if (secret is null)
+            {
+                return Stop(ctx, ReproductionOutcome.Blocked, AuthenticationStatus.CredentialsRequired,
+                    $"Credentials for {env.DisplayName} are required before the agent can sign in.");
+            }
+
+            _redactor.RegisterSecret(secret.Password);
+            _redactor.RegisterSecret(secret.Token);
         }
-
-        var secret = await _vault.ResolveSecretAsync(ctx.CredentialProfileId.Value, cancellationToken);
-        if (secret is null)
-        {
-            ctx.ReproductionOutcome = ReproductionOutcome.Blocked;
-            ctx.ReproductionNotes = "Could not resolve credentials from vault. Re-enter the portal password.";
-            ctx.CredentialProfileId = null;
-            return SkillResult.Ok(ctx.ReproductionNotes);
-        }
-
-        _redactor.RegisterSecret(secret.Password);
-        _redactor.RegisterSecret(secret.Token);
-
-        var evidenceDir = ResolveEvidenceDir(ctx.SessionId);
-        Directory.CreateDirectory(evidenceDir);
 
         try
         {
-            var page = await _sessions.StartAsync(ctx.SessionId, cancellationToken);
+            ctx.AuthenticationStatus = AuthenticationStatus.InProgress;
+            ctx.AuthenticationMessage = $"Signing in to {env.DisplayName}…";
+
+            // 3) Fresh, isolated browser context for this investigation + environment.
+            var page = await _sessions.StartAsync(ctx.InvestigationId, cancellationToken);
             page.SetDefaultTimeout(_options.Browser.ActionTimeoutMs);
             page.SetDefaultNavigationTimeout(_options.Browser.NavigationTimeoutMs);
-            request.Progress?.Report("Navigating to environment URL.");
-            var response = await page.GotoAsync(ctx.EnvironmentUrl, new PageGotoOptions
+
+            var target = BuildStartUrl(env);
+            request.Progress?.Report($"Opening {env.DisplayName} ({env.Type}) at {env.SafeBaseUrl} in an isolated browser session.");
+            var response = await page.GotoAsync(target, new PageGotoOptions
             {
                 WaitUntil = WaitUntilState.DOMContentLoaded,
                 Timeout = _options.Browser.NavigationTimeoutMs
             });
             if (response is null || (int)response.Status >= 500)
             {
-                ctx.ReproductionOutcome = ReproductionOutcome.EnvironmentUnavailable;
-                ctx.ReproductionNotes = $"Environment returned status {(response?.Status)?.ToString() ?? "none"}.";
-                await _sessions.CloseAsync(ctx.SessionId);
-                return SkillResult.Ok(ctx.ReproductionNotes);
+                await _sessions.CloseAsync(ctx.InvestigationId);
+                return Stop(ctx, ReproductionOutcome.EnvironmentUnavailable, AuthenticationStatus.Failed,
+                    $"{env.DisplayName} returned HTTP {(response?.Status)?.ToString() ?? "no response"} — the environment appears to be unavailable.");
             }
 
-            await TryLoginAsync(page, secret, ctx, request.Progress, _options.Browser);
             await BrowserWaits.WaitForPageReadyAsync(page, _options.Browser);
-            request.Progress?.Report("Waiting for home/assignments content to finish loading…");
-            await BrowserWaits.WaitForSpinnersAsync(page, _options.Browser);
-            var screenshot = Path.Combine(evidenceDir, "login-or-home.png");
-            await page.ScreenshotAsync(new PageScreenshotOptions { Path = screenshot, FullPage = true });
-            ctx.Evidence.Add(new EvidenceItem
-            {
-                Kind = "screenshot",
-                Path = screenshot,
-                Caption = "After login / connect — home page before navigating into the ticket feature"
-            });
-            request.Progress?.Report("Browser session ready (kept open for reproduction).");
-            return SkillResult.Ok("Connected to environment.");
+
+            // Evidence 1: the selected environment before anything is typed (no credentials on screen).
+            await EvidenceScreenshots.CaptureAsync(page, _options, ctx, "01-environment",
+                $"Selected environment: {env.DisplayName} ({env.Type}) — {env.SafeBaseUrl}" +
+                (env.IsProduction ? " — PRODUCTION (read-only investigation)" : ""),
+                EvidenceCategories.Environment, env.Login);
+
+            var loginPage = new PlaywrightLoginPage(page, _options.Browser);
+            var result = secret is null
+                ? await _loginFlow.LoginAsync(loginPage, env.Login, new CredentialSecret { Username = "" }, request.Progress, cancellationToken)
+                : await _loginFlow.LoginAsync(loginPage, env.Login, secret, request.Progress, cancellationToken);
+            secret = null; // drop the reference as soon as the form was submitted
+
+            return await ApplyResultAsync(ctx, env, page, result, request.Progress);
         }
         catch (PlaywrightException ex) when (ex.Message.Contains("Executable doesn't exist", StringComparison.OrdinalIgnoreCase))
         {
-            await _sessions.CloseAsync(ctx.SessionId);
-            ctx.ReproductionOutcome = ReproductionOutcome.Error;
-            ctx.ReproductionNotes = "Playwright browsers not installed. Run: pwsh bin/Debug/net8.0/playwright.ps1 install chromium";
-            _logger.LogWarning(ex, "Playwright browser missing");
-            return SkillResult.Ok(ctx.ReproductionNotes);
+            await _sessions.CloseAsync(ctx.InvestigationId);
+            _logger.LogWarning("Playwright browser executable is missing.");
+            return Stop(ctx, ReproductionOutcome.Error, AuthenticationStatus.Failed,
+                "Playwright browsers not installed. Run: pwsh bin/Debug/net8.0/playwright.ps1 install chromium");
+        }
+        catch (OperationCanceledException)
+        {
+            await _sessions.CloseAsync(ctx.InvestigationId);
+            throw;
         }
         catch (Exception ex)
         {
-            await _sessions.CloseAsync(ctx.SessionId);
-            ctx.ReproductionOutcome = ReproductionOutcome.Error;
-            ctx.ReproductionNotes = SummarizeBrowserError(_redactor.Redact(ex.Message));
-            _logger.LogWarning(ex, "Browser automation failed");
-            return SkillResult.Ok("Browser automation encountered an error (classified, not as NOT_REPRODUCED).");
+            await _sessions.CloseAsync(ctx.InvestigationId);
+            var safe = SummarizeBrowserError(_redactor.Redact(ex.Message));
+            // Never log the raw exception: Playwright call logs can echo typed values.
+            _logger.LogWarning("Browser sign-in failed for environment {EnvironmentId}: {Message}", env.Id, safe);
+            return Stop(ctx, ReproductionOutcome.Error, AuthenticationStatus.Failed, $"Sign-in to {env.DisplayName} failed: {safe}");
+        }
+        finally
+        {
+            secret = null;
         }
     }
 
-    private static async Task TryLoginAsync(
-        IPage page,
-        CredentialSecret secret,
-        RuntimeContext ctx,
-        IProgress<string>? progress,
-        BrowserTimingOptions timing)
+    private async Task<SkillResult> RecheckAsync(RuntimeContext ctx, AppEnvironment env, IPage page, IProgress<string>? progress, CancellationToken cancellationToken)
     {
-        var userSelectors = new[]
+        try
         {
-            "#UserName",
-            "input[name='UserName']",
-            "input[autocomplete='username']",
-            "input[name*=user i]",
-            "input[id*=user i]",
-            "input[type=text]",
-            "input[type=email]"
-        };
-        var passSelectors = new[]
-        {
-            "#Password",
-            "input[name='Password']",
-            "input[autocomplete='current-password']",
-            "input[type=password]"
-        };
-        var submitSelectors = new[]
-        {
-            "button[type=submit]:visible",
-            "input[type=submit]:visible",
-            "#btnSubmit",
-            "button:has-text('Log in')",
-            "button:has-text('Sign in')",
-            "button:has-text('Submit')"
-        };
-
-        var user = await FindVisibleAsync(page, userSelectors);
-        var pass = await FindVisibleAsync(page, passSelectors);
-
-        if (user is null || pass is null)
-        {
-            progress?.Report("No visible login form detected; continuing with current page.");
-            return;
+            progress?.Report($"Re-checking sign-in state on {env.DisplayName}.");
+            var result = await _loginFlow.RecheckAsync(new PlaywrightLoginPage(page, _options.Browser), env.Login, cancellationToken);
+            return await ApplyResultAsync(ctx, env, page, result, progress);
         }
-
-        progress?.Report($"Logging in as '{ctx.Username ?? secret.Username}' (role: {ctx.Role ?? "n/a"}).");
-        await user.FillAsync(secret.Username, new LocatorFillOptions { Timeout = timing.ActionTimeoutMs });
-        await pass.FillAsync(secret.Password ?? secret.Token ?? "", new LocatorFillOptions { Timeout = timing.ActionTimeoutMs });
-
-        foreach (var sel in submitSelectors)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            var btn = page.Locator(sel).First;
-            if (await btn.CountAsync() == 0 || !await btn.IsVisibleAsync())
-                continue;
-
-            await btn.ClickAsync(new LocatorClickOptions { Timeout = timing.ActionTimeoutMs });
-            await BrowserWaits.WaitForPageReadyAsync(page, timing);
-            return;
+            await _sessions.CloseAsync(ctx.InvestigationId);
+            var safe = SummarizeBrowserError(_redactor.Redact(ex.Message));
+            _logger.LogWarning("Sign-in re-check failed for environment {EnvironmentId}: {Message}", env.Id, safe);
+            return Stop(ctx, ReproductionOutcome.Error, AuthenticationStatus.Failed, $"Re-checking sign-in failed: {safe}");
         }
     }
 
-    private static async Task<ILocator?> FindVisibleAsync(IPage page, IEnumerable<string> selectors)
+    private async Task<SkillResult> ApplyResultAsync(RuntimeContext ctx, AppEnvironment env, IPage page, AuthenticationResult result, IProgress<string>? progress)
     {
-        foreach (var sel in selectors)
+        ctx.AuthenticationStatus = result.Status;
+        ctx.AuthenticationMessage = _redactor.Redact(result.Message);
+        progress?.Report($"Sign-in result for {env.DisplayName}: {AuthenticationStatusDisplay.Label(result.Status)}. {ctx.AuthenticationMessage}");
+
+        switch (result.Status)
         {
-            var loc = page.Locator(sel);
-            var count = await loc.CountAsync();
-            for (var i = 0; i < count; i++)
-            {
-                var candidate = loc.Nth(i);
+            case AuthenticationStatus.Succeeded:
+                await BrowserWaits.WaitForPageReadyAsync(page, _options.Browser);
+                progress?.Report("Waiting for home content to finish loading…");
+                await BrowserWaits.WaitForSpinnersAsync(page, _options.Browser);
+                // Evidence 2: application after a verified, successful sign-in.
+                await EvidenceScreenshots.CaptureAsync(page, _options, ctx, "02-after-login",
+                    $"Signed in to {env.DisplayName} — application home before navigating into the ticket feature",
+                    EvidenceCategories.PostLogin, env.Login);
+                ctx.ReproductionOutcome = ReproductionOutcome.NotStarted;
+                ctx.ReproductionNotes = null;
+                progress?.Report("Browser session ready (kept open for reproduction).");
+                return SkillResult.Ok($"Signed in to {env.DisplayName}.");
+
+            case AuthenticationStatus.MfaRequired:
+            case AuthenticationStatus.ManualInterventionRequired:
+                // Keep the browser open so the user can finish the step (headed mode) and the agent can re-check.
+                // No screenshot: verification pages often show personal details (phone, e-mail).
+                ctx.ReproductionOutcome = ReproductionOutcome.Blocked;
+                ctx.ReproductionNotes = ctx.AuthenticationMessage;
+                if (_options.Browser.Headless)
+                    ctx.AuthenticationMessage += " The browser is currently headless, so this step cannot be completed interactively.";
+                return SkillResult.Ok("Sign-in paused — user action required.");
+
+            case AuthenticationStatus.InvalidCredentials:
+                // Evidence: the error message shown by the login page (password field masked).
                 try
                 {
-                    if (await candidate.IsVisibleAsync())
-                        return candidate;
+                    await EvidenceScreenshots.CaptureAsync(page, _options, ctx, "02-login-rejected",
+                        $"Sign-in to {env.DisplayName} was rejected — login error message (password field masked)",
+                        EvidenceCategories.ErrorMessage, env.Login);
                 }
-                catch (PlaywrightException)
-                {
-                }
-            }
-        }
+                catch (PlaywrightException) { /* evidence is best-effort */ }
+                await _sessions.CloseAsync(ctx.InvestigationId);
+                ctx.ReproductionOutcome = ReproductionOutcome.Blocked;
+                ctx.ReproductionNotes = ctx.AuthenticationMessage;
+                return SkillResult.Ok("Sign-in rejected.");
 
-        return null;
+            default:
+                await _sessions.CloseAsync(ctx.InvestigationId);
+                ctx.ReproductionOutcome = ReproductionOutcome.Blocked;
+                ctx.ReproductionNotes = ctx.AuthenticationMessage;
+                return SkillResult.Ok("Sign-in did not succeed.");
+        }
+    }
+
+    private static SkillResult Stop(RuntimeContext ctx, ReproductionOutcome outcome, AuthenticationStatus status, string message)
+    {
+        ctx.ReproductionOutcome = outcome;
+        ctx.ReproductionNotes = message;
+        ctx.AuthenticationStatus = status;
+        ctx.AuthenticationMessage = message;
+        return SkillResult.Ok(message);
+    }
+
+    public static string BuildStartUrl(AppEnvironment env)
+    {
+        var baseUrl = env.BaseUrl!;
+        if (string.IsNullOrWhiteSpace(env.Login.LoginPath))
+            return baseUrl;
+        return baseUrl.TrimEnd('/') + "/" + env.Login.LoginPath!.TrimStart('/');
     }
 
     internal static string SummarizeBrowserError(string message)
@@ -216,16 +272,8 @@ public sealed class BrowserAutomationSkill : ISkill
             ?? message.Split('\n')[0].Trim();
 
         if (message.Contains("not visible", StringComparison.OrdinalIgnoreCase))
-            return "Login failed: targeted a hidden form field. Retry Continue — the agent now prefers the visible username/password fields.";
+            return "Login failed: targeted a hidden form field. Check the environment's login selectors.";
 
         return first.Length > 240 ? first[..240] + "…" : first;
-    }
-
-    private string ResolveEvidenceDir(Guid sessionId)
-    {
-        var root = Path.IsPathRooted(_options.EvidenceDirectory)
-            ? _options.EvidenceDirectory
-            : Path.Combine(Directory.GetCurrentDirectory(), _options.EvidenceDirectory);
-        return Path.Combine(root, sessionId.ToString("N"));
     }
 }

@@ -21,6 +21,7 @@ public sealed class AgentDbContext : DbContext
             e.Property(x => x.Label).HasMaxLength(256).IsRequired();
             e.Property(x => x.EncryptedSecret).IsRequired();
             e.HasIndex(x => new { x.SystemName, x.EnvironmentName, x.Username });
+            e.HasIndex(x => new { x.OwnerId, x.EnvironmentId });
         });
 
         modelBuilder.Entity<EngineeringLessonEntity>(e =>
@@ -39,6 +40,10 @@ public sealed class CredentialProfileEntity
     public string Label { get; set; } = "";
     public string? SystemName { get; set; }
     public string? EnvironmentName { get; set; }
+    /// <summary>Registry environment ID (upper-case). Null only for legacy, unscoped rows.</summary>
+    public string? EnvironmentId { get; set; }
+    /// <summary>Owning user (ICurrentUserAccessor.UserId). Null only for legacy rows.</summary>
+    public string? OwnerId { get; set; }
     public string? Username { get; set; }
     public string? Role { get; set; }
     public string AuthType { get; set; } = "password";

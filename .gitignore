@@ -8,3 +8,6 @@ App_Data/
 *.db-shm
 *.db-wal
 .vs/
+
+# Machine-local configuration (environment URLs, overrides) — never commit
+**/appsettings.Local.json
