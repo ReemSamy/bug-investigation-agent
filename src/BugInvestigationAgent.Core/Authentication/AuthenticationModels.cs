@@ -14,7 +14,9 @@ public enum AuthenticationStatus
     MfaRequired,
     /// <summary>Some other step needs a human (SSO redirect, unknown login form, consent page…).</summary>
     ManualInterventionRequired,
-    Failed
+    Failed,
+    /// <summary>The login form went away, but the environment has no success selector configured, so sign-in cannot be verified.</summary>
+    VerificationNotConfigured
 }
 
 public sealed class AuthenticationResult
@@ -44,6 +46,7 @@ public static class AuthenticationStatusDisplay
         AuthenticationStatus.MfaRequired => "Additional verification (MFA) required",
         AuthenticationStatus.ManualInterventionRequired => "Manual action required",
         AuthenticationStatus.Failed => "Sign-in failed",
+        AuthenticationStatus.VerificationNotConfigured => "Sign-in not verifiable — environment needs setup",
         _ => status.ToString()
     };
 }

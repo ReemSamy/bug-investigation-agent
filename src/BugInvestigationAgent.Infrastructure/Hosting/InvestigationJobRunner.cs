@@ -25,12 +25,33 @@ public sealed class WorkerOptions
     public int MaxConcurrentJobs { get; set; } = 3;
     /// <summary>Hard limit per job. Jira's work-item trigger allows ~60 minutes for remote agents.</summary>
     public int JobTimeoutMinutes { get; set; } = 55;
-    /// <summary>How long a job may wait for user input before it times out.</summary>
+    /// <summary>How long a suspended job may wait for user input before it times out (enforced by the sweeper).</summary>
     public int AwaitingInputTimeoutMinutes { get; set; } = 30;
+    /// <summary>
+    /// MFA is the only input for which a worker keeps the job (the signed-in-in-progress browser page cannot be
+    /// checkpointed). After this many minutes the job is suspended and the user must sign in again.
+    /// </summary>
+    public int MfaHoldMinutes { get; set; } = 5;
+    /// <summary>Maximum total lifetime of a job (Forge user tokens live at most 4 hours).</summary>
+    public int MaxJobLifetimeMinutes { get; set; } = 230;
     public int LeaseSeconds { get; set; } = 60;
     public int PollIntervalMs { get; set; } = 1500;
     /// <summary>Unique worker id (container replica name). Defaults to machine name + process id.</summary>
     public string? WorkerId { get; set; }
+}
+
+public enum JobRunOutcome
+{
+    /// <summary>Another worker owns the job, or it is already finished — nothing was done.</summary>
+    NotLeased,
+    /// <summary>The job reached a terminal state.</summary>
+    Finished,
+    /// <summary>The job waits for user input; state checkpointed and the worker slot released.</summary>
+    Suspended,
+    /// <summary>Technical error: re-queued for retry (or failed after the retry budget).</summary>
+    Requeued,
+    /// <summary>The lease was lost (another worker took over) or the worker is shutting down.</summary>
+    Abandoned
 }
 
 /// <summary>Non-secret payload stored (encrypted) as a job secret when the user submits environment credentials.</summary>
@@ -63,14 +84,16 @@ public sealed class InvestigationJobRunner
     private readonly RepositoryMappingOptions _repoOptions;
     private readonly ForgeOptions _forge;
     private readonly ILogger<InvestigationJobRunner> _logger;
+    private readonly JobInputService _input;
 
     public InvestigationJobRunner(
         IInvestigationJobStore jobs, IJobSecretStore secrets, IAuditLog audit, IAgentSessionStore sessions,
         IAgentOrchestrator orchestrator, IEnvironmentSelectionService environments, IEvidenceStore evidence,
         JiraReportPublisher publisher, ISecretRedactor redactor, IServiceScopeFactory scopes,
         IOptions<WorkerOptions> options, IOptions<AgentOptions> agentOptions, IOptions<RepositoryMappingOptions> repoOptions,
-        IOptions<ForgeOptions> forge, ILogger<InvestigationJobRunner> logger)
+        IOptions<ForgeOptions> forge, ILogger<InvestigationJobRunner> logger, JobInputService input)
     {
+        _input = input;
         _jobs = jobs;
         _secrets = secrets;
         _audit = audit;
@@ -90,16 +113,22 @@ public sealed class InvestigationJobRunner
 
     private TimeSpan Lease => TimeSpan.FromSeconds(Math.Max(15, _options.LeaseSeconds));
 
-    public async Task RunAsync(Guid jobId, string workerId, CancellationToken stoppingToken)
+    /// <param name="onLeased">Invoked once the job lease is held (e.g. to complete the queue message).</param>
+    public async Task<JobRunOutcome> RunAsync(Guid jobId, string workerId, CancellationToken stoppingToken, Func<Task>? onLeased = null)
     {
+        // Lease owner is unique PER RUN (not per worker process): a duplicate delivery of the same job to the same
+        // worker can never run it twice concurrently.
+        workerId = $"{workerId}/{Guid.NewGuid():N}";
         if (!await _jobs.TryAcquireLeaseAsync(jobId, workerId, Lease, stoppingToken))
-            return; // another worker owns it
+            return JobRunOutcome.NotLeased; // another worker owns it, or it is finished
+        if (onLeased is not null)
+            await onLeased();
 
         var job = await _jobs.GetAsync(jobId, stoppingToken);
         if (job is null || job.IsTerminal)
         {
             await _jobs.ReleaseLeaseAsync(jobId, workerId, CancellationToken.None);
-            return;
+            return JobRunOutcome.NotLeased;
         }
 
         var identity = HostedJobIdentity.From(job);
@@ -108,25 +137,30 @@ public sealed class InvestigationJobRunner
 
         _sessions.Remove(job.Id);
         var session = _sessions.Create(job.Id);
-        var startedAt = job.StartedAt ?? DateTimeOffset.UtcNow;
+        var resume = !string.IsNullOrWhiteSpace(job.ContextSnapshotJson);
+        if (resume)
+            session.Context = RuntimeContextSnapshot.Restore(job.ContextSnapshotJson!, job.Id);
+        var runStartedAt = DateTimeOffset.UtcNow;
         await _jobs.UpdateAsync(job.Id, j =>
         {
             j.Status = InvestigationJobStatus.Running;
-            j.StartedAt ??= startedAt;
-            j.StatusMessage = j.RetryCount > 0 ? $"Restarted (attempt {j.RetryCount + 1})." : "Investigation started.";
-            j.AwaitingInputKind = null;
-            j.AwaitingInputPrompt = null;
+            j.StartedAt ??= runStartedAt;
+            j.StatusMessage = resume ? "Resuming the investigation."
+                : j.RetryCount > 0 ? $"Restarted (attempt {j.RetryCount + 1})." : "Investigation started.";
         }, stoppingToken);
-        await _jobs.AppendEventAsync(job.Id, "status", "Investigation started on a worker.", stoppingToken);
+        await _jobs.AppendEventAsync(job.Id, "status", resume ? "Investigation resumed on a worker." : "Investigation started on a worker.", stoppingToken);
 
         using var runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        var deadline = startedAt.AddMinutes(_options.JobTimeoutMinutes);
-        var runTask = _orchestrator.RunAsync(job.Id, job.IssueKey, null, runCts.Token);
-
+        // Active-execution budget for this run; waiting time is not counted (the job is suspended while waiting).
+        var deadline = runStartedAt.AddMinutes(_options.JobTimeoutMinutes);
+        var runTask = resume
+            ? _orchestrator.ResumeAsync(job.Id, runCts.Token)
+            : _orchestrator.RunAsync(job.Id, job.IssueKey, null, runCts.Token);
+        var loggedLines = session.Context.StatusLog.Count;
         var bridge = new InputBridge();
-        var loggedLines = 0;
         var finalStatus = (InvestigationJobStatus?)null;
         string? finalMessage = null;
+        var outcome = JobRunOutcome.Finished;
 
         try
         {
@@ -141,7 +175,7 @@ public sealed class InvestigationJobRunner
                     _logger.LogWarning("Lost the lease for job {JobId}; stopping local execution.", job.Id);
                     await _orchestrator.CancelAsync(job.Id);
                     await SafeAwait(runTask);
-                    return; // another worker will continue; do not touch the job status
+                    return JobRunOutcome.Abandoned; // another worker will continue; do not touch the job status
                 }
 
                 job = await _jobs.GetAsync(job.Id, stoppingToken) ?? job;
@@ -167,23 +201,28 @@ public sealed class InvestigationJobRunner
                 if (session.State is AgentState.AwaitingMissingInfo or AgentState.Blocked
                     && session.MissingInfoWaiter is { Task.IsCompleted: false })
                 {
-                    var outcome = await HandleMissingInfoAsync(job, session, bridge, stoppingToken);
-                    if (outcome is { } stop)
+                    var decision = await HandleMissingInfoAsync(job, session, bridge, stoppingToken);
+                    if (decision.TerminalStatus is { } terminal)
                     {
                         await _orchestrator.CancelAsync(job.Id);
-                        (finalStatus, finalMessage) = stop;
+                        (finalStatus, finalMessage) = (terminal, decision.Message!);
                         break;
                     }
-                }
-                else if (job.Status == InvestigationJobStatus.AwaitingUserInput)
-                {
-                    bridge.Reset();
-                    await _jobs.UpdateAsync(job.Id, j =>
+
+                    if (decision.AwaitKind is { } kind)
                     {
-                        j.Status = InvestigationJobStatus.Running;
-                        j.AwaitingInputKind = null;
-                        j.AwaitingInputPrompt = null;
-                    }, stoppingToken);
+                        // MFA: keep the open sign-in page for a short, bounded time; everything else releases the slot now.
+                        var holdExpired = kind == AwaitingInputKinds.MfaCode &&
+                                          DateTimeOffset.UtcNow - bridge.AwaitingSince > TimeSpan.FromMinutes(_options.MfaHoldMinutes);
+                        if (kind != AwaitingInputKinds.MfaCode || holdExpired)
+                        {
+                            await SuspendAsync(job, session, holdExpired, stoppingToken);
+                            await _orchestrator.CancelAsync(job.Id);
+                            await SafeAwait(runTask);
+                            outcome = JobRunOutcome.Suspended;
+                            return outcome;
+                        }
+                    }
                 }
             }
 
@@ -200,12 +239,15 @@ public sealed class InvestigationJobRunner
             }
 
             await FinishAsync(job, session, finalStatus.Value, finalMessage!, CancellationToken.None);
+            return JobRunOutcome.Finished;
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
             // Worker shutting down: leave the job non-terminal; the lease expires and recovery re-queues it.
             await _orchestrator.CancelAsync(job.Id);
             await SafeAwait(runTask);
+            outcome = JobRunOutcome.Abandoned;
+            return outcome;
         }
         catch (Exception ex)
         {
@@ -213,13 +255,49 @@ public sealed class InvestigationJobRunner
             await _orchestrator.CancelAsync(job.Id);
             await SafeAwait(runTask);
             await RetryOrFailAsync(job.Id, _redactor.Redact(ex.Message), CancellationToken.None);
+            return JobRunOutcome.Requeued;
         }
         finally
         {
             _sessions.Remove(job.Id);
             TryDeleteDirectory(_repoOptions.CheckoutDirectoryFor(job.Id));
             await _jobs.ReleaseLeaseAsync(job.Id, workerId, CancellationToken.None);
+            if (outcome == JobRunOutcome.Suspended)
+                await _input.WakeIfInputPendingAsync(job.Id, CancellationToken.None); // input that raced the suspension
         }
+    }
+
+    /// <summary>
+    /// Checkpoints the investigation (secret-free context JSON), keeps evidence captured so far, and leaves the job in
+    /// Awaiting User Input WITHOUT a worker. It resumes on any worker when the user responds.
+    /// </summary>
+    private async Task SuspendAsync(InvestigationJob job, AgentSession session, bool mfaHoldExpired, CancellationToken ct)
+    {
+        var ctx = session.Context;
+        var snapshot = RuntimeContextSnapshot.Serialize(ctx);
+        try
+        {
+            await _evidence.PublishAsync(job.Id, Path.Combine(EvidenceRoot(), job.Id.ToString("N")), ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Evidence upload at suspension failed for job {JobId}: {Message}", job.Id, _redactor.Redact(ex.Message));
+        }
+
+        await _jobs.UpdateAsync(job.Id, j =>
+        {
+            j.ContextSnapshotJson = snapshot;
+            j.Status = InvestigationJobStatus.AwaitingUserInput;
+            if (mfaHoldExpired)
+            {
+                j.AwaitingInputKind = AwaitingInputKinds.Credentials;
+                j.AwaitingInputPrompt = j.StatusMessage =
+                    $"The verification step was not completed within {_options.MfaHoldMinutes} minutes, so the sign-in was discarded. " +
+                    $"Submit your {j.EnvironmentId ?? ctx.SelectedEnvironmentId} credentials again on the agent's personal settings page ({SettingsLink(j)}), then reply \"continue\".";
+                j.AwaitingSinceUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+        }, ct);
+        await _jobs.AppendEventAsync(job.Id, "status", "Waiting for user input — investigation checkpointed, worker released.", ct);
     }
 
     private sealed class InputBridge
@@ -237,18 +315,25 @@ public sealed class InvestigationJobRunner
     /// Satisfies the pipeline's missing information from job inputs, or moves the job to Awaiting User Input.
     /// Returns a terminal outcome when the job cannot continue.
     /// </summary>
-    private async Task<(InvestigationJobStatus, string)?> HandleMissingInfoAsync(
+    private sealed record InputDecision(InvestigationJobStatus? TerminalStatus = null, string? Message = null, string? AwaitKind = null)
+    {
+        public static readonly InputDecision Continue = new();
+        public static InputDecision Terminal(InvestigationJobStatus status, string message) => new(status, message);
+        public static InputDecision Await(string kind) => new(null, null, kind);
+    }
+
+    private async Task<InputDecision> HandleMissingInfoAsync(
         InvestigationJob job, AgentSession session, InputBridge bridge, CancellationToken ct)
     {
         var ctx = session.Context;
         if (ctx.MissingFields.Count == 0)
-            return null; // pipeline is about to continue (input already accepted)
+            return InputDecision.Continue; // pipeline is about to continue (input already accepted)
         var keys = ctx.MissingFields.Select(f => f.Key).Where(k => k != "reproductionSteps").ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         if (keys.Contains("jiraSettings"))
-            return (InvestigationJobStatus.Failed, "The issue could not be read with your Jira permissions (or the authorization expired). Invoke the agent again from the issue.");
+            return InputDecision.Terminal(InvestigationJobStatus.Failed, "The issue could not be read with your Jira permissions (or the authorization expired). Invoke the agent again from the issue.");
         if (keys.Contains("workspacePath"))
-            return (InvestigationJobStatus.Failed, "No source repository is mapped for this project (Repositories:Mappings).");
+            return InputDecision.Terminal(InvestigationJobStatus.Failed, "No source repository is mapped for this project (Repositories:Mappings).");
 
         // Apply a pending free-text reply (environment choice / MFA approval).
         if (!string.IsNullOrWhiteSpace(job.PendingUserReply))
@@ -354,13 +439,14 @@ public sealed class InvestigationJobRunner
         if (awaitingKind is not null)
         {
             bridge.AwaitingSince ??= DateTimeOffset.UtcNow;
-            if (DateTimeOffset.UtcNow - bridge.AwaitingSince > TimeSpan.FromMinutes(_options.AwaitingInputTimeoutMinutes))
-                return (InvestigationJobStatus.TimedOut, $"No response within {_options.AwaitingInputTimeoutMinutes} minutes ({awaitingKind}).");
-
             if (job.Status != InvestigationJobStatus.AwaitingUserInput || job.AwaitingInputPrompt != prompt || job.PendingUserReply is not null)
             {
+                var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 await _jobs.UpdateAsync(job.Id, j =>
                 {
+                    // The input timeout keeps running across resumes for the same question (no reset by unrelated replies).
+                    if (j.AwaitingInputKind != awaitingKind || j.AwaitingSinceUnixMs == 0)
+                        j.AwaitingSinceUnixMs = now;
                     j.Status = InvestigationJobStatus.AwaitingUserInput;
                     j.AwaitingInputKind = awaitingKind;
                     j.AwaitingInputPrompt = prompt;
@@ -371,14 +457,14 @@ public sealed class InvestigationJobRunner
                 }, ct);
                 await _jobs.AppendEventAsync(job.Id, "input", prompt!, ct);
             }
-            return null;
+            return InputDecision.Await(awaitingKind);
         }
 
         // Everything needed is available — feed it to the pipeline (once per distinct input set).
         var fingerprint = string.Join("|", values.OrderBy(v => v.Key).Select(v => v.Key == "mfaCode" ? "mfa" : $"{v.Key}={v.Value}"))
                           + (credentials is null ? "" : "|creds:" + Guid.NewGuid());
         if (fingerprint == bridge.LastSubmittedFingerprint && credentials is null)
-            return null;
+            return InputDecision.Continue;
         bridge.LastSubmittedFingerprint = fingerprint;
         bridge.AwaitingSince = null;
 
@@ -387,6 +473,7 @@ public sealed class InvestigationJobRunner
             j.Status = InvestigationJobStatus.Running;
             j.AwaitingInputKind = null;
             j.AwaitingInputPrompt = null;
+            j.AwaitingSinceUnixMs = 0;
             j.PendingUserReply = null;
             j.StatusMessage = "Input received — continuing.";
         }, ct);
@@ -407,7 +494,7 @@ public sealed class InvestigationJobRunner
                 Action = AuditActions.CredentialsSaved, Detail = "Credentials saved encrypted for this user and environment (opt-in)."
             }, ct);
         credentials = null;
-        return null;
+        return InputDecision.Continue;
     }
 
     private string EnvironmentPrompt(RuntimeContext ctx, string? error)
@@ -424,6 +511,10 @@ public sealed class InvestigationJobRunner
                    ? "No environments are configured on the agent service. Ask an administrator to register them."
                    : $"Which environment should I investigate? Reply with one of: {string.Join(", ", envs)}.{suggestion}");
     }
+
+    private string EvidenceRoot() => Path.IsPathRooted(_agentOptions.EvidenceDirectory)
+        ? _agentOptions.EvidenceDirectory
+        : Path.Combine(Directory.GetCurrentDirectory(), _agentOptions.EvidenceDirectory);
 
     private string SettingsLink(InvestigationJob job) =>
         $"{job.SiteUrl?.TrimEnd('/')}/jira/settings/personal/apps/{_forge.AppId}/{job.ForgeEnvironmentId ?? _forge.EnvironmentId}";
@@ -459,12 +550,9 @@ public sealed class InvestigationJobRunner
             if (status != InvestigationJobStatus.Completed)
                 summary = $"**{status}:** {message}\n\n" + summary;
 
-            var root = Path.IsPathRooted(_agentOptions.EvidenceDirectory)
-                ? _agentOptions.EvidenceDirectory
-                : Path.Combine(Directory.GetCurrentDirectory(), _agentOptions.EvidenceDirectory);
             try
             {
-                evidenceRef = await _evidence.PublishAsync(job.Id, Path.Combine(root, job.Id.ToString("N")), ct);
+                evidenceRef = await _evidence.PublishAsync(job.Id, Path.Combine(EvidenceRoot(), job.Id.ToString("N")), ct);
             }
             catch (Exception ex)
             {
@@ -484,6 +572,8 @@ public sealed class InvestigationJobRunner
             j.ReportJson = reportJson ?? j.ReportJson;
             j.EvidenceReference = evidenceRef ?? j.EvidenceReference;
             j.ErrorDetails = status == InvestigationJobStatus.Completed ? null : message;
+            j.ContextSnapshotJson = null;
+            j.AwaitingSinceUnixMs = 0;
         }, ct);
         await _jobs.AppendEventAsync(job.Id, "status", $"{status}: {message}", ct);
         await _audit.WriteAsync(new AuditEntry

@@ -116,6 +116,8 @@ public sealed class BrowserAutomationSkill : ISkill
 
             // 3) Fresh, isolated browser context for this investigation + environment.
             var page = await _sessions.StartAsync(ctx.InvestigationId, cancellationToken);
+            // Network-level read-only enforcement (before the first navigation).
+            await ReadOnlyBrowserGuard.InstallAsync(page, ctx, env, request.Progress);
             page.SetDefaultTimeout(_options.Browser.ActionTimeoutMs);
             page.SetDefaultNavigationTimeout(_options.Browser.NavigationTimeoutMs);
 

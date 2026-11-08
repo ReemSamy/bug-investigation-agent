@@ -90,14 +90,31 @@ public class LoginFlowTests
     private static readonly CredentialSecret Secret = new() { Username = "qa_admin", Password = "S3cret!pw" };
 
     [Test]
-    public async Task Succeeds_only_when_login_form_is_dismissed_without_error()
+    public async Task Without_a_success_selector_login_is_reported_as_unverifiable_not_successful()
+    {
+        var page = new FakeLoginPage(User, Pass, Submit)
+        {
+            OnSubmit = p => { p.Hide(User, Pass, Submit); p.Text = "Welcome"; }
+        };
+
+        var result = await new LoginFlow().LoginAsync(page, Options(), Secret);
+
+        Assert.That(result.Status, Is.EqualTo(AuthenticationStatus.VerificationNotConfigured));
+        Assert.That(result.Message, Does.Contain("SuccessSelectors"));
+        Assert.That(Options().WithDefaults().CanVerifyLogin, Is.False);
+        Assert.That(Options(o => o.SuccessSelectors = ["#user-menu"]).WithDefaults().CanVerifyLogin, Is.True);
+    }
+
+    [Test]
+    public async Task Heuristic_success_only_with_explicit_local_opt_in()
     {
         var page = new FakeLoginPage(User, Pass, Submit)
         {
             OnSubmit = p => { p.Hide(User, Pass, Submit); p.Text = "Welcome, My Assignments"; p.Url = "https://app.example.test/Home"; }
         };
 
-        var result = await new LoginFlow().LoginAsync(page, Options(), Secret);
+        var result = await new LoginFlow().LoginAsync(page, Options(o => o.AllowUnverifiedLogin = true), Secret);
+        Assert.That(result.Message, Does.Contain("UNVERIFIED"));
 
         Assert.That(result.Status, Is.EqualTo(AuthenticationStatus.Succeeded));
         Assert.That(page.Filled[User], Is.EqualTo("qa_admin"));
@@ -172,8 +189,9 @@ public class LoginFlowTests
         Assert.That((await flow.RecheckAsync(page, Options())).Status, Is.EqualTo(AuthenticationStatus.MfaRequired));
 
         page.Hide("#otp");
+        page.Show("#user-menu");
         page.Text = "Dashboard";
-        Assert.That((await flow.RecheckAsync(page, Options())).Status, Is.EqualTo(AuthenticationStatus.Succeeded));
+        Assert.That((await flow.RecheckAsync(page, Options(o => o.SuccessSelectors = ["#user-menu"]))).Status, Is.EqualTo(AuthenticationStatus.Succeeded));
     }
 
     [Test]
@@ -211,8 +229,8 @@ public class LoginFlowTests
     [Test]
     public async Task Presses_enter_when_no_submit_button_is_found()
     {
-        var page = new FakeLoginPage(User, Pass) { OnSubmit = p => p.Hide(User, Pass) };
-        var result = await new LoginFlow().LoginAsync(page, Options(), Secret);
+        var page = new FakeLoginPage(User, Pass) { OnSubmit = p => { p.Hide(User, Pass); p.Show("#user-menu"); } };
+        var result = await new LoginFlow().LoginAsync(page, Options(o => o.SuccessSelectors = ["#user-menu"]), Secret);
         Assert.That(page.PressedEnter, Is.True);
         Assert.That(result.Status, Is.EqualTo(AuthenticationStatus.Succeeded));
     }

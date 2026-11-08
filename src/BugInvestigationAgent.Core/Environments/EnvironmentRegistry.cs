@@ -17,6 +17,8 @@ public sealed class AppEnvironment
     public EnvironmentType Type { get; init; }
     public bool Enabled { get; init; }
     public bool IsAdHoc { get; init; }
+    /// <summary>Configuration allows a user's explicit confirmation to lift read-only protection (default false).</summary>
+    public bool AllowUserConfirmedStateChanges { get; init; }
     public IReadOnlyList<string> Aliases { get; init; } = Array.Empty<string>();
     public IReadOnlyDictionary<string, string> Metadata { get; init; } = new Dictionary<string, string>();
     public required LoginFormOptions Login { get; init; }
@@ -92,6 +94,7 @@ public sealed class ConfigurationEnvironmentRegistry : IEnvironmentRegistry
         BaseUrl = string.IsNullOrWhiteSpace(d.BaseUrl) ? null : d.BaseUrl.Trim(),
         Type = d.Type,
         Enabled = d.Enabled,
+        AllowUserConfirmedStateChanges = d.AllowUserConfirmedStateChanges,
         Aliases = d.Aliases.Where(a => !string.IsNullOrWhiteSpace(a)).Select(a => a.Trim()).ToList(),
         Metadata = new Dictionary<string, string>(d.Metadata, StringComparer.OrdinalIgnoreCase),
         Login = defaults.MergeWith(d.Login).WithDefaults()

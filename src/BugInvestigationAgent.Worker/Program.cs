@@ -14,6 +14,8 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 builder.Configuration.AddEnvironmentVariables();
 builder.Configuration.AddHostedSecrets();
+BugInvestigationAgent.Infrastructure.Hosting.HostedConfigurationValidator.ThrowIfInvalid(
+    builder.Configuration, builder.Environment.IsDevelopment(), isApi: false);
 
 builder.Services.Configure<AgentOptions>(builder.Configuration.GetSection(AgentOptions.SectionName));
 builder.Services.Configure<JiraOptions>(builder.Configuration.GetSection(JiraOptions.SectionName));
@@ -29,6 +31,7 @@ builder.Services.AddBugInvestigationHostedMode();
 builder.Services.AddScoped<BugInvestigationAgent.Core.Skills.ISkill, BugInvestigationAgent.Skills.Code.SourceRepositorySkill>();
 
 builder.Services.AddSingleton<InvestigationJobRunner>();
+builder.Services.AddHealthChecks().AddCheck<BugInvestigationAgent.Worker.BrowserReadinessCheck>("browser", tags: [ReadinessExtensions.ReadyTag]);
 builder.Services.AddHostedService<InvestigationWorkerService>();
 builder.Services.AddHostedService<JobRecoveryService>();
 
@@ -38,11 +41,14 @@ if (!string.IsNullOrWhiteSpace(builder.Configuration["APPLICATIONINSIGHTS_CONNEC
 var app = builder.Build();
 
 // Container Apps probes only (no business endpoints on the worker; ingress disabled in IaC).
-app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/readyz", async (IDbContextFactory<AgentDbContext> db, CancellationToken ct) =>
+// Liveness: process up. Readiness: real dependencies (database + schema, key ring, storage, queue[, browser]).
+app.MapHealthChecks("/healthz", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions { Predicate = _ => false });
+app.MapHealthChecks("/readyz", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
 {
-    await using var ctx = await db.CreateDbContextAsync(ct);
-    return await ctx.Database.CanConnectAsync(ct) ? Results.Ok(new { status = "ready" }) : Results.StatusCode(503);
+    Predicate = r => r.Tags.Contains(BugInvestigationAgent.Infrastructure.Hosting.ReadinessExtensions.ReadyTag),
+    ResponseWriter = BugInvestigationAgent.Infrastructure.Hosting.ReadinessExtensions.WriteResponse
 });
 
 app.Run();
+
+public partial class Program;

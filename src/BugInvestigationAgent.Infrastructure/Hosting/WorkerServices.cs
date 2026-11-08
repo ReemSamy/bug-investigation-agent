@@ -34,10 +34,10 @@ public sealed class InvestigationWorkerService : BackgroundService
         while (!stoppingToken.IsCancellationRequested)
         {
             await slots.WaitAsync(stoppingToken);
-            Guid? jobId;
+            QueuedJobMessage? message;
             try
             {
-                jobId = await _queue.DequeueAsync(TimeSpan.FromSeconds(5), stoppingToken);
+                message = await _queue.DequeueAsync(TimeSpan.FromSeconds(5), stoppingToken);
             }
             catch (OperationCanceledException)
             {
@@ -51,7 +51,7 @@ public sealed class InvestigationWorkerService : BackgroundService
                 continue;
             }
 
-            if (jobId is null)
+            if (message is null)
             {
                 slots.Release();
                 continue;
@@ -60,13 +60,51 @@ public sealed class InvestigationWorkerService : BackgroundService
             running.RemoveAll(t => t.IsCompleted);
             running.Add(Task.Run(async () =>
             {
-                try { await _runner.RunAsync(jobId.Value, _workerId, stoppingToken); }
-                catch (Exception ex) { _logger.LogError("Job {JobId} runner error: {Message}", jobId, ex.Message); }
+                try { await QueueMessageProcessor.ProcessAsync(message, _runner, _workerId, _logger, stoppingToken); }
                 finally { slots.Release(); }
             }, CancellationToken.None));
         }
 
         await Task.WhenAll(running);
+    }
+}
+
+/// <summary>Settles one queue message around a job run (testable without Service Bus).</summary>
+public static class QueueMessageProcessor
+{
+    public static async Task<JobRunOutcome?> ProcessAsync(QueuedJobMessage message, InvestigationJobRunner runner, string workerId, ILogger logger, CancellationToken ct)
+    {
+        if (message.JobId is not { } jobId)
+        {
+            await message.DeadLetterAsync("Message body is not an investigation job id.");
+            return null;
+        }
+
+        var settled = false;
+        try
+        {
+            // The DB lease is the source of truth: settle the message as soon as this worker owns the job.
+            var outcome = await runner.RunAsync(jobId, workerId, ct, async () =>
+            {
+                settled = true;
+                await message.CompleteAsync();
+            });
+            if (!settled)
+                await message.CompleteAsync(); // owned by another worker or already finished — nothing to do
+            return outcome;
+        }
+        catch (Exception ex) when (!settled)
+        {
+            // Failure before the job was owned (e.g. database unavailable): let the queue redeliver / dead-letter it.
+            logger.LogWarning("Job {JobId} could not be started (delivery {Delivery}): {Message}", jobId, message.DeliveryCount, ex.Message);
+            await message.AbandonAsync();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("Job {JobId} runner error: {Message}", jobId, ex.Message);
+            return null;
+        }
     }
 }
 
@@ -82,10 +120,12 @@ public sealed class JobRecoveryService : BackgroundService
     private readonly JiraReportPublisher _publisher;
     private readonly ISecretRedactor _redactor;
     private readonly ILogger<JobRecoveryService> _logger;
+    private readonly WorkerOptions _options;
 
     public JobRecoveryService(IInvestigationJobStore jobs, IInvestigationQueue queue, IJobSecretStore secrets,
-        JiraReportPublisher publisher, ISecretRedactor redactor, ILogger<JobRecoveryService> logger)
+        JiraReportPublisher publisher, ISecretRedactor redactor, ILogger<JobRecoveryService> logger, IOptions<WorkerOptions> options)
     {
+        _options = options.Value;
         _jobs = jobs;
         _queue = queue;
         _secrets = secrets;
@@ -134,6 +174,26 @@ public sealed class JobRecoveryService : BackgroundService
             }, ct);
             if (job?.Status == InvestigationJobStatus.Queued)
                 await _queue.EnqueueAsync(id, null, ct);
+        }
+
+        // Suspended jobs whose user never answered, and jobs past their maximum lifetime.
+        var now = DateTimeOffset.UtcNow;
+        foreach (var id in await _jobs.ListExpiredAsync(
+                     now.AddMinutes(-_options.AwaitingInputTimeoutMinutes).ToUnixTimeMilliseconds(),
+                     now.AddMinutes(-_options.MaxJobLifetimeMinutes).ToUnixTimeMilliseconds(), 20, ct))
+        {
+            await _jobs.UpdateAsync(id, j =>
+            {
+                var wasWaiting = j.Status == InvestigationJobStatus.AwaitingUserInput;
+                j.Status = InvestigationJobStatus.TimedOut;
+                j.CompletedAt = DateTimeOffset.UtcNow;
+                j.StatusMessage = j.ErrorDetails = wasWaiting
+                    ? $"No response within {_options.AwaitingInputTimeoutMinutes} minutes ({j.AwaitingInputKind})."
+                    : "The investigation exceeded its maximum lifetime.";
+                j.ContextSnapshotJson = null;
+                j.LeaseOwner = null;
+            }, ct);
+            await _secrets.DeleteAllAsync(id, null, ct);
         }
 
         await _secrets.PurgeExpiredAsync(ct);

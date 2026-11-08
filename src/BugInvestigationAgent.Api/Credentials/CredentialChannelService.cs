@@ -45,15 +45,18 @@ public enum SubmissionResult { Accepted, Unauthorized, NotAwaiting, Invalid }
 public sealed class CredentialChannelService
 {
     private static readonly TimeSpan TicketTtl = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan CredentialTtl = TimeSpan.FromMinutes(30);
+    // As short as practical: long enough for the job to be resumed and sign in, then purged.
+    private static readonly TimeSpan CredentialTtl = TimeSpan.FromMinutes(15);
 
     private readonly IInvestigationJobStore _jobs;
     private readonly IJobSecretStore _secrets;
     private readonly IAuditLog _audit;
     private readonly IEnvironmentSelectionService _environments;
+    private readonly JobInputService _input;
 
-    public CredentialChannelService(IInvestigationJobStore jobs, IJobSecretStore secrets, IAuditLog audit, IEnvironmentSelectionService environments)
+    public CredentialChannelService(IInvestigationJobStore jobs, IJobSecretStore secrets, IAuditLog audit, IEnvironmentSelectionService environments, JobInputService input)
     {
+        _input = input;
         _jobs = jobs;
         _secrets = secrets;
         _audit = audit;
@@ -111,6 +114,7 @@ public sealed class CredentialChannelService
             Action = AuditActions.CredentialsSubmitted,
             Detail = $"Credentials for {envId} submitted via the secure settings page{(body.Remember ? " (remember requested)" : "")}."
         }, ct);
+        await _input.WakeAsync(jobId, ct); // resume the suspended investigation
         return SubmissionResult.Accepted;
     }
 
@@ -129,6 +133,7 @@ public sealed class CredentialChannelService
             TenantId = job.Job!.TenantId, AccountId = job.Job.InvokingAccountId, JobId = jobId,
             Action = AuditActions.AuthenticationAttempt, Detail = "Verification code submitted via the secure settings page."
         }, ct);
+        await _input.WakeAsync(jobId, ct); // no-op while a worker holds the MFA page (it polls for the code)
         return SubmissionResult.Accepted;
     }
 

@@ -1,6 +1,6 @@
 # AI Bug Investigation Agent — Jira Cloud team integration
 
-Status: **implemented and tested against simulated Jira, browser and Azure DevOps. Not yet deployed.**
+Status: **implemented; verified locally with real PostgreSQL, real Chromium and the real API/worker hosts; Jira Cloud, Azure and Azure DevOps simulated. Not deployed.**
 Do not announce Jira availability to the team until the pilot checklist at the end has been completed on the real
 Jira site.
 
@@ -69,7 +69,7 @@ the caller); conversations are looked up by (installation, contextId, accountId)
   not stored.
 * **Durability:** workers hold a renewable DB lease (atomic conditional UPDATE). If a worker dies, the recovery
   sweeper re-queues the job (`RetryCount`, max 2). Job timeout is 55 min (Jira's work-item trigger allows 60).
-  Awaiting-input timeout is 30 min.
+  Awaiting-input timeout is 30 min (enforced while the job is suspended, without holding a worker).
 * **Reports:** `InvestigationReport` separates **confirmed findings** (backed by evidence) from **hypotheses**
   (root cause from code analysis is always a hypothesis unless a fix and retest proved it). It is published once.
   The comment carries the property `bug-investigation-agent-report = {investigationId}`, and retries look for it
@@ -141,28 +141,24 @@ PostgreSQL. Switch to EF migrations before the schema changes again.
 5. Follow progress in the agent task. The final report appears in the task and as a comment on the issue.
 6. `cancel` stops your investigation; `rerun` starts a new one in the same conversation.
 
-## 8. Implemented vs. needs external setup
+## 8. Status
 
-| Capability | State |
-|---|---|
-| FIT validation (JWKS, iss, aud, exp, cloud allow-list) | Implemented, unit-tested; rejects forged tokens against Atlassian's real JWKS (smoke test) |
-| A2A SendMessage / GetTask / CancelTask, follow-ups, rerun | Implemented, integration-tested with simulated Jira |
-| User-token reads, permission enforcement, identity cross-checks | Implemented, tested (403/404 → rejected; spoofed ids rejected) |
-| Durable jobs, leases, retries, timeouts, cancellation, audit | Implemented, tested (SQLite; same EF code on PostgreSQL) |
-| Concurrent multi-user execution, per-user/env credential isolation | Implemented, end-to-end tested (2 users concurrently) |
-| Secure credential/MFA channel (tickets, CORS) | Backend implemented and tested; **Custom UI page not built/linted (no Node.js on the dev machine)** |
-| Structured report + idempotent Jira comment + screenshots | Implemented, tested against simulated Jira |
-| Azure DevOps provider (MI token, clone, search, commits) | Implemented, tested with simulated Azure DevOps; **needs real org/repo access** |
-| Service Bus queue, Blob evidence, Key Vault, PostgreSQL MI auth, App Insights | Implemented; **only exercisable in Azure** (local runs use DB queue, local files, SQLite) |
-| Bicep / Dockerfiles | Written; **not validated or deployed** (no Azure CLI/Docker here, and no authorization to deploy) |
-| Forge app (manifest, agent connector, settings page) | Written against current Atlassian docs; **not registered, linted or deployed** |
-| Playwright sign-in on KMSRC/KMSQA | Implemented earlier; **needs real URLs + test accounts** |
+See **[deployment-and-pilot-runbook.md](deployment-and-pilot-runbook.md)** for the verification matrix (real vs.
+simulated), exact deployment commands, administrator approvals, rollback, the pilot checklist and the security
+assessment. Summary of the production-readiness changes:
 
-## 9. Pilot acceptance checklist (on the real site — not yet done)
-
-1. Install the Forge app and verify the `installed` event reaches the API (audit `app.installed`).
-2. Developer A assigns the agent to a bug, picks KMSRC, signs in, and gets a report comment on the issue.
-3. Developer B starts another investigation at the same time; both complete independently.
-4. A user without access to a restricted project invokes the agent on that project's issue and is rejected.
-5. Retry and cancel paths; no duplicate comments after a worker restart (kill a worker mid-run).
-6. Review App Insights and the audit table: no tokens or passwords anywhere.
+* **Identity:** hosted mode uses only the verified Atlassian account of the job (no OS-account fallback — fail closed);
+  every task call proves the caller (FIT principal or the caller's own Jira token); startup refuses insecure
+  configuration outside Development; code/git/PR/CI/deploy permissions are forced off in hosted mode.
+* **Worker lifecycle:** jobs waiting for environment/credentials are checkpointed (secret-free context JSON) and the
+  worker slot is released; any worker resumes them when input arrives (no re-analysis). MFA keeps the browser for at
+  most `Worker:MfaHoldMinutes` (default 5) because a half-signed-in page cannot be checkpointed. Lease ownership is per
+  run, so duplicate deliveries never run a job twice. Input timeouts and maximum lifetime are enforced by the sweeper.
+* **Production safety:** network-level read-only guard in the browser context (non-GET requests blocked after sign-in
+  unless admin-allow-listed), independent of step text or LLM output; user confirmation only counts where an admin
+  set `AllowUserConfirmedStateChanges`.
+* **Login verification:** per-environment `SuccessSelectors` / `ErrorSelectors` / `MfaSelectors` / `LoginPath`; with no
+  success selector the result is *Verification not configured* (job fails with "environment needs setup").
+* **Data:** versioned migrations (`__SchemaVersion`, PostgreSQL advisory lock / SQLite IMMEDIATE transactions,
+  WAL for local SQLite); Service Bus peek-lock with complete / abandon / dead-letter; readiness checks for database
+  schema, key ring, storage, queue and (worker) browser.

@@ -26,22 +26,26 @@ namespace BugInvestigationAgent.Api.Tests;
 /// <summary>SQLite file database per test — same code paths as PostgreSQL in production (EF Core).</summary>
 public sealed class TestDb : IDbContextFactory<AgentDbContext>, IDisposable
 {
-    private readonly SqliteConnection _keepAlive;
+    private readonly string _file;
     private readonly DbContextOptions<AgentDbContext> _options;
 
     public TestDb()
     {
-        var name = "bia-" + Guid.NewGuid().ToString("N");
-        var cs = $"Data Source={name};Mode=Memory;Cache=Shared";
-        _keepAlive = new SqliteConnection(cs);
-        _keepAlive.Open();
-        _options = new DbContextOptionsBuilder<AgentDbContext>().UseSqlite(cs).Options;
+        // File database in WAL mode (as configured by the migrator) — realistic concurrency, unlike shared-cache memory DBs.
+        _file = Path.Combine(Path.GetTempPath(), $"bia-test-{Guid.NewGuid():N}.db");
+        _options = new DbContextOptionsBuilder<AgentDbContext>().UseSqlite($"Data Source={_file};Default Timeout=30").Options;
         using var db = CreateDbContext();
-        db.Database.EnsureCreated();
+        DatabaseMigrator.MigrateAsync(db).GetAwaiter().GetResult();
     }
 
     public AgentDbContext CreateDbContext() => new(_options);
-    public void Dispose() => _keepAlive.Dispose();
+
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        foreach (var f in new[] { _file, _file + "-wal", _file + "-shm" })
+            try { File.Delete(f); } catch { }
+    }
 }
 
 public class JobStoreAndLeaseTests

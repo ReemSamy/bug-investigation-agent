@@ -2,18 +2,55 @@
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
   "contentVersion": "1.0.0.0",
   "parameters": {
-    "prefix": { "value": "bia" },
-    "forgeAppId": { "value": "<forge-app-uuid-from-forge-register>" },
-    "allowedJiraCloudIds": { "value": [ "<your-jira-cloud-id>" ] },
-    "kmsrcBaseUrl": { "value": "https://<your-kmsrc-host>" },
-    "kmsqaBaseUrl": { "value": "https://<your-kmsqa-host>" },
-    "jiraProjectKey": { "value": "<JIRA-PROJECT-KEY>" },
-    "adoOrganization": { "value": "<azure-devops-org>" },
-    "adoProject": { "value": "<azure-devops-project>" },
-    "adoRepository": { "value": "<repository>" },
-    "adoBranch": { "value": "main" },
-    "postgresAdminGroupObjectId": { "value": "<entra-group-object-id>" },
-    "postgresAdminGroupName": { "value": "<entra-group-name>" },
-    "workerMaxReplicas": { "value": 3 }
+    "prefix": {
+      "value": "bia"
+    },
+    "forgeAppId": {
+      "value": "<forge-app-uuid-from-forge-register>"
+    },
+    "allowedJiraCloudIds": {
+      "value": [
+        "<your-jira-cloud-id>"
+      ]
+    },
+    "kmsrcBaseUrl": {
+      "value": "https://<your-kmsrc-host>"
+    },
+    "kmsqaBaseUrl": {
+      "value": "https://<your-kmsqa-host>"
+    },
+    "jiraProjectKey": {
+      "value": "<JIRA-PROJECT-KEY>"
+    },
+    "adoOrganization": {
+      "value": "<azure-devops-org>"
+    },
+    "adoProject": {
+      "value": "<azure-devops-project>"
+    },
+    "adoRepository": {
+      "value": "<repository>"
+    },
+    "adoBranch": {
+      "value": "main"
+    },
+    "postgresAdminGroupObjectId": {
+      "value": "<entra-group-object-id>"
+    },
+    "postgresAdminGroupName": {
+      "value": "<entra-group-name>"
+    },
+    "workerMaxReplicas": {
+      "value": 3
+    },
+    "networkMode": {
+      "value": "public"
+    },
+    "forgeEnvironmentId": {
+      "value": "<forge-environment-id>"
+    },
+    "workerSlotsPerReplica": {
+      "value": 3
+    }
   }
 }

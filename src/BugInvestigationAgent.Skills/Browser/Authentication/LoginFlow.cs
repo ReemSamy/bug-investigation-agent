@@ -191,8 +191,13 @@ public sealed class LoginFlow
 
         if (afterSubmit && !passwordVisible)
         {
-            return AuthenticationResult.Of(AuthenticationStatus.Succeeded,
-                "Login form was dismissed with no error, MFA or session message shown.", url);
+            return o.AllowUnverifiedLogin == true
+                ? AuthenticationResult.Of(AuthenticationStatus.Succeeded,
+                    "Login form was dismissed with no error, MFA or session message shown (UNVERIFIED heuristic — no success selector configured).", url)
+                : AuthenticationResult.Of(AuthenticationStatus.VerificationNotConfigured,
+                    "The login form was submitted and disappeared, but this environment has no success selector configured " +
+                    "(EnvironmentRegistry:Environments:<id>:Login:SuccessSelectors), so the sign-in could not be verified. " +
+                    "An administrator must configure it before investigations can run.", url);
         }
 
         return null;

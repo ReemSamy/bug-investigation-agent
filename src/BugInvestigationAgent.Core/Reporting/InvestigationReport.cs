@@ -79,6 +79,10 @@ public static class InvestigationReportBuilder
                 break;
         }
 
+        if (ctx.BlockedBrowserRequests.Count > 0)
+            confirmed.Add($"Read-only protection blocked {ctx.BlockedBrowserRequests.Count} state-changing browser request(s): " +
+                          string.Join("; ", ctx.BlockedBrowserRequests.Distinct().Take(5)));
+
         foreach (var err in pageErrors.Take(3))
             confirmed.Add($"Browser reported a page error: {err}");
 

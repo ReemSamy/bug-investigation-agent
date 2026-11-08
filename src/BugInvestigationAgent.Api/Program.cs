@@ -17,6 +17,8 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 builder.Configuration.AddEnvironmentVariables();
 builder.Configuration.AddHostedSecrets();
+BugInvestigationAgent.Infrastructure.Hosting.HostedConfigurationValidator.ThrowIfInvalid(
+    builder.Configuration, builder.Environment.IsDevelopment(), isApi: true);
 
 builder.Services.Configure<AgentOptions>(builder.Configuration.GetSection(AgentOptions.SectionName));
 builder.Services.Configure<EnvironmentRegistryOptions>(builder.Configuration.GetSection(EnvironmentRegistryOptions.SectionName));
@@ -25,9 +27,9 @@ builder.Services.AddBugInvestigationInfrastructure(builder.Environment.ContentRo
 builder.Services.AddBugInvestigationHostedMode();
 // The API never runs browsers (workers do); the orchestrator registered by Core only needs a closer.
 builder.Services.AddSingleton<BugInvestigationAgent.Core.Browser.IBrowserSessionCloser, NoBrowserSessions>();
+builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<A2AAgentService>();
 builder.Services.AddSingleton<CredentialChannelService>();
-builder.Services.AddHealthChecks();
 
 if (!string.IsNullOrWhiteSpace(builder.Configuration["APPLICATIONINSIGHTS_CONNECTION_STRING"]))
     builder.Services.AddOpenTelemetry().UseAzureMonitor();
@@ -47,11 +49,12 @@ var app = builder.Build();
 app.UseCors();
 
 // ── Health (unauthenticated; no data) ──
-app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/readyz", async (IDbContextFactory<AgentDbContext> db, CancellationToken ct) =>
+// Liveness: process up. Readiness: real dependencies (database + schema, key ring, storage, queue[, browser]).
+app.MapHealthChecks("/healthz", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions { Predicate = _ => false });
+app.MapHealthChecks("/readyz", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
 {
-    await using var ctx = await db.CreateDbContextAsync(ct);
-    return await ctx.Database.CanConnectAsync(ct) ? Results.Ok(new { status = "ready" }) : Results.StatusCode(503);
+    Predicate = r => r.Tags.Contains(BugInvestigationAgent.Infrastructure.Hosting.ReadinessExtensions.ReadyTag),
+    ResponseWriter = BugInvestigationAgent.Infrastructure.Hosting.ReadinessExtensions.WriteResponse
 });
 
 // ── Forge-authenticated endpoints (Forge Invocation Token required) ──

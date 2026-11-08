@@ -148,20 +148,21 @@ public sealed class DatabaseInvestigationQueue : IInvestigationQueue
         _local.Writer.TryWrite(jobId);
     }
 
-    public async Task<Guid?> DequeueAsync(TimeSpan wait, CancellationToken cancellationToken = default)
+    public async Task<QueuedJobMessage?> DequeueAsync(TimeSpan wait, CancellationToken cancellationToken = default)
     {
+        // Settlement is a no-op: the jobs table IS the queue (Queued status + lease), so nothing is lost on failure.
         if (_local.Reader.TryRead(out var local))
-            return local;
+            return new QueuedJobMessage { JobId = local };
 
         var runnable = await _jobs.ListRunnableAsync(1, cancellationToken);
         if (runnable.Count > 0)
-            return runnable[0];
+            return new QueuedJobMessage { JobId = runnable[0] };
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(wait);
         try
         {
-            return await _local.Reader.ReadAsync(timeout.Token);
+            return new QueuedJobMessage { JobId = await _local.Reader.ReadAsync(timeout.Token) };
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -177,9 +178,15 @@ public sealed class ServiceBusInvestigationQueue : IInvestigationQueue, IAsyncDi
     private readonly ServiceBusReceiver _receiver;
 
     public ServiceBusInvestigationQueue(ServiceBusClient client, string queueName)
+        : this(client.CreateSender(queueName),
+               client.CreateReceiver(queueName, new ServiceBusReceiverOptions { ReceiveMode = ServiceBusReceiveMode.PeekLock }))
     {
-        _sender = client.CreateSender(queueName);
-        _receiver = client.CreateReceiver(queueName, new ServiceBusReceiverOptions { ReceiveMode = ServiceBusReceiveMode.PeekLock });
+    }
+
+    public ServiceBusInvestigationQueue(ServiceBusSender sender, ServiceBusReceiver receiver)
+    {
+        _sender = sender;
+        _receiver = receiver;
     }
 
     public async Task EnqueueAsync(Guid jobId, TimeSpan? delay = null, CancellationToken cancellationToken = default)
@@ -190,14 +197,23 @@ public sealed class ServiceBusInvestigationQueue : IInvestigationQueue, IAsyncDi
         await _sender.SendMessageAsync(message, cancellationToken);
     }
 
-    public async Task<Guid?> DequeueAsync(TimeSpan wait, CancellationToken cancellationToken = default)
+    public async Task<QueuedJobMessage?> DequeueAsync(TimeSpan wait, CancellationToken cancellationToken = default)
     {
         var message = await _receiver.ReceiveMessageAsync(wait, cancellationToken);
         if (message is null)
             return null;
-        // Complete immediately: if the worker dies the job lease expires and the recovery sweeper re-enqueues it.
-        await _receiver.CompleteMessageAsync(message, cancellationToken);
-        return Guid.TryParse(message.Body.ToString(), out var id) ? id : null;
+
+        // Peek-lock: the worker completes the message once it holds the job lease (or when there is nothing to do),
+        // abandons it on transient failures (Service Bus redelivers, then dead-letters after MaxDeliveryCount),
+        // and dead-letters poison messages explicitly.
+        return new QueuedJobMessage
+        {
+            JobId = Guid.TryParse(message.Body.ToString(), out var id) ? id : null,
+            DeliveryCount = message.DeliveryCount,
+            CompleteAsync = () => _receiver.CompleteMessageAsync(message, CancellationToken.None),
+            AbandonAsync = () => _receiver.AbandonMessageAsync(message, null, CancellationToken.None),
+            DeadLetterAsync = reason => _receiver.DeadLetterMessageAsync(message, "invalid-message", reason, CancellationToken.None)
+        };
     }
 
     public async ValueTask DisposeAsync()

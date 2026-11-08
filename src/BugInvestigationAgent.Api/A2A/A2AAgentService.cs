@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Caching.Memory;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -26,10 +27,15 @@ public sealed class A2AAgentService
     private readonly IAuditLog _audit;
     private readonly JiraCloudClient _jira;
     private readonly ILogger<A2AAgentService> _logger;
+    private readonly BugInvestigationAgent.Infrastructure.Hosting.JobInputService _input;
+    private readonly Microsoft.Extensions.Caching.Memory.IMemoryCache _callerCache;
 
     public A2AAgentService(IInvestigationJobStore jobs, IJobSecretStore secrets, IInvestigationQueue queue, IAuditLog audit,
-        JiraCloudClient jira, ILogger<A2AAgentService> logger)
+        JiraCloudClient jira, ILogger<A2AAgentService> logger, Microsoft.Extensions.Caching.Memory.IMemoryCache callerCache,
+        BugInvestigationAgent.Infrastructure.Hosting.JobInputService input)
     {
+        _input = input;
+        _callerCache = callerCache;
         _jobs = jobs;
         _secrets = secrets;
         _queue = queue;
@@ -175,15 +181,8 @@ public sealed class A2AAgentService
                 "Please don't type passwords or codes in this chat. Use the agent's personal settings page in Jira, then reply \"continue\"."));
         }
 
-        job = await _jobs.UpdateAsync(job.Id, j =>
-        {
-            j.PendingUserReply = text.Length > 500 ? text[..500] : text;
-            if (j.Status == InvestigationJobStatus.AwaitingUserInput)
-            {
-                j.Status = InvestigationJobStatus.Running;
-                j.StatusMessage = "Thanks — continuing the investigation.";
-            }
-        }, ct) ?? job;
+        // Stores the reply; a suspended job (no worker) is re-queued exactly once and resumes from its checkpoint.
+        job = await _input.RecordReplyAsync(job.Id, text, ct) ?? job;
         await _jobs.AppendEventAsync(job.Id, "reply", "User replied in Jira.", ct);
         return A2AJson.Result(id, ToTask(job));
     }
@@ -191,53 +190,62 @@ public sealed class A2AAgentService
     // ── GetTask / CancelTask ───────────────────────────────────────────────
     private async Task<JsonObject> GetTaskAsync(JsonNode? id, JsonElement @params, ForgeInvocation fit, ForgeTokens tokens, CancellationToken ct)
     {
-        var job = await FindTaskAsync(@params, fit, ct);
+        var job = await FindTaskAsync(@params, fit, tokens, ct);
         if (job is null)
             return A2AJson.Error(id, A2AErrors.TaskNotFound, "Task not found.");
 
-        // Polls keep the job's Jira authorizations fresh (user token only when the poll is for the same user).
-        await StoreTokensAsync(job.Id, tokens, includeUser: fit.PrincipalAccountId == job.InvokingAccountId, ct);
+        // Polls keep the job's Jira authorizations fresh (the caller was verified to be the job's owner).
+        await StoreTokensAsync(job.Id, tokens, includeUser: true, ct);
         return A2AJson.Result(id, ToTask(job));
     }
 
     private async Task<JsonObject> CancelTaskAsync(JsonNode? id, JsonElement @params, ForgeInvocation fit, ForgeTokens tokens, CancellationToken ct)
     {
-        var job = await FindTaskAsync(@params, fit, ct);
+        var job = await FindTaskAsync(@params, fit, tokens, ct);
         if (job is null)
             return A2AJson.Error(id, A2AErrors.TaskNotFound, "Task not found.");
         if (job.IsTerminal)
             return A2AJson.Error(id, A2AErrors.TaskNotCancelable, "Task already finished.");
 
-        job = await RequestCancelAsync(job, fit.PrincipalAccountId ?? job.InvokingAccountId, ct);
+        job = await RequestCancelAsync(job, job.InvokingAccountId, ct);
         return A2AJson.Result(id, ToTask(job));
     }
 
-    private async Task<InvestigationJob?> FindTaskAsync(JsonElement @params, ForgeInvocation fit, CancellationToken ct)
+    private async Task<InvestigationJob?> FindTaskAsync(JsonElement @params, ForgeInvocation fit, ForgeTokens tokens, CancellationToken ct)
     {
         if (@params.ValueKind != JsonValueKind.Object ||
-            !@params.TryGetProperty("id", out var taskIdEl) || !Guid.TryParse(taskIdEl.GetString(), out var taskId))
+            !@params.TryGetProperty("id", out var taskIdEl) || taskIdEl.ValueKind != JsonValueKind.String ||
+            !Guid.TryParse(taskIdEl.GetString(), out var taskId))
             return null;
         var job = await _jobs.GetAsync(taskId, ct);
-        // Tenant isolation always; user isolation whenever Jira identifies the caller.
         if (job is null || job.TenantId != fit.InstallationId)
+            return null; // tenant isolation
+
+        // User isolation is fail-closed: the caller must be PROVEN to be the job's owner — by the signed FIT principal,
+        // or by the caller's own Jira token. A task id alone (even within the same site) never grants access.
+        var caller = await VerifiedCallerAsync(fit, tokens, job.CloudId, job.ApiBaseUrl, ct);
+        return caller is not null && caller == job.InvokingAccountId ? job : null;
+    }
+
+    private async Task<string?> VerifiedCallerAsync(ForgeInvocation fit, ForgeTokens tokens, string cloudId, string? apiBaseUrl, CancellationToken ct)
+    {
+        if (fit.PrincipalAccountId is not null)
+            return fit.PrincipalAccountId;
+        if (string.IsNullOrWhiteSpace(tokens.UserToken))
             return null;
-        if (fit.PrincipalAccountId is not null && fit.PrincipalAccountId != job.InvokingAccountId)
-            return null;
-        return job;
+
+        var key = "caller:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(tokens.UserToken)));
+        if (_callerCache.TryGetValue(key, out string? cached))
+            return cached;
+        var me = await _jira.GetMyselfAsync(JiraCloudUrls.ApiBase(cloudId, apiBaseUrl), tokens.UserToken, ct);
+        if (me is not null)
+            _callerCache.Set(key, me.AccountId, TimeSpan.FromMinutes(5)); // keyed by token hash, never the token itself
+        return me?.AccountId;
     }
 
     private async Task<InvestigationJob> RequestCancelAsync(InvestigationJob job, string accountId, CancellationToken ct)
     {
-        var updated = await _jobs.UpdateAsync(job.Id, j =>
-        {
-            j.CancelRequested = true;
-            if (j.Status == InvestigationJobStatus.Queued || j.LeaseOwner is null)
-            {
-                j.Status = InvestigationJobStatus.Cancelled;
-                j.CompletedAt = DateTimeOffset.UtcNow;
-            }
-            j.StatusMessage = "Investigation cancelled.";
-        }, ct) ?? job;
+        var updated = await _input.CancelAsync(job.Id, ct) ?? job;
         await Audit(job.TenantId, accountId, job.Id, AuditActions.InvestigationCancelled, $"Cancel requested for {job.IssueKey}.", true, ct);
         return updated; // a running job stops at the worker's next check (reported as cancelled immediately)
     }

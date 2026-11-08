@@ -52,6 +52,11 @@ public sealed class EnvironmentDefinitionOptions
     public List<string> Aliases { get; set; } = new();
     /// <summary>Optional per-environment login-form overrides (non-empty lists replace the defaults).</summary>
     public LoginFormOptions? Login { get; set; }
+    /// <summary>
+    /// Exceptional workflows only: allow a user's explicit per-investigation confirmation to lift the read-only guard on
+    /// a Production environment. Default false — Production stays read-only regardless of what the user ticks.
+    /// </summary>
+    public bool AllowUserConfirmedStateChanges { get; set; }
     /// <summary>Optional free-form metadata (region, owner team, notes). Never secrets.</summary>
     public Dictionary<string, string> Metadata { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
@@ -81,8 +86,19 @@ public sealed class LoginFormOptions
     public List<string> MaskSelectors { get; set; } = new();
     public int? OutcomeTimeoutMs { get; set; }
     public int? PollIntervalMs { get; set; }
+    /// <summary>
+    /// Local development only: treat "login form disappeared without an error" as success when no SuccessSelectors are
+    /// configured. Default false — without a success selector the agent reports that the environment needs setup.
+    /// </summary>
+    public bool? AllowUnverifiedLogin { get; set; }
+    /// <summary>Read-only environments: request paths (regex) that may use POST/PUT/PATCH/DELETE because they only read
+    /// (e.g. a search API). Everything else that is not GET/HEAD/OPTIONS is blocked after sign-in.</summary>
+    public List<string> ReadOnlyAllowedWritePaths { get; set; } = new();
 
     public bool RequiresLogin => !string.Equals(Mode, "None", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when a successful sign-in can actually be verified for this environment.</summary>
+    public bool CanVerifyLogin => !RequiresLogin || SuccessSelectors.Count > 0 || AllowUnverifiedLogin == true;
 
     /// <summary>Overlay: non-empty values in <paramref name="overrides"/> replace values here.</summary>
     public LoginFormOptions MergeWith(LoginFormOptions? overrides)
@@ -105,7 +121,9 @@ public sealed class LoginFormOptions
             SessionExpiredTextPatterns = Pick(overrides.SessionExpiredTextPatterns, SessionExpiredTextPatterns),
             MaskSelectors = MaskSelectors.Concat(overrides.MaskSelectors).Distinct().ToList(),
             OutcomeTimeoutMs = overrides.OutcomeTimeoutMs ?? OutcomeTimeoutMs,
-            PollIntervalMs = overrides.PollIntervalMs ?? PollIntervalMs
+            PollIntervalMs = overrides.PollIntervalMs ?? PollIntervalMs,
+            AllowUnverifiedLogin = overrides.AllowUnverifiedLogin ?? AllowUnverifiedLogin,
+            ReadOnlyAllowedWritePaths = Pick(overrides.ReadOnlyAllowedWritePaths, ReadOnlyAllowedWritePaths)
         };
     }
 
@@ -153,7 +171,9 @@ public sealed class LoginFormOptions
         SessionExpiredTextPatterns = SessionExpiredTextPatterns.ToList(),
         MaskSelectors = MaskSelectors.ToList(),
         OutcomeTimeoutMs = OutcomeTimeoutMs,
-        PollIntervalMs = PollIntervalMs
+        PollIntervalMs = PollIntervalMs,
+        AllowUnverifiedLogin = AllowUnverifiedLogin,
+        ReadOnlyAllowedWritePaths = ReadOnlyAllowedWritePaths.ToList()
     };
 
     private static List<string> Pick(List<string> preferred, List<string> fallback) =>

@@ -20,6 +20,8 @@ public interface IInvestigationJobStore
     /// <summary>Non-terminal jobs whose worker lease expired (worker crashed) — recovery candidates.</summary>
     Task<IReadOnlyList<Guid>> ListOrphanedAsync(int max, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<Guid>> ListUnpublishedCompletedAsync(int max, CancellationToken cancellationToken = default);
+    /// <summary>Suspended jobs (no worker) waiting for input since before <paramref name="awaitingBeforeUnixMs"/>, or created before <paramref name="createdBeforeUnixMs"/>.</summary>
+    Task<IReadOnlyList<Guid>> ListExpiredAsync(long awaitingBeforeUnixMs, long createdBeforeUnixMs, int max, CancellationToken cancellationToken = default);
 
     Task UpsertInstallationAsync(JiraInstallation installation, CancellationToken cancellationToken = default);
     Task<JiraInstallation?> GetInstallationAsync(string installationId, CancellationToken cancellationToken = default);
@@ -29,8 +31,20 @@ public interface IInvestigationJobStore
 public interface IInvestigationQueue
 {
     Task EnqueueAsync(Guid jobId, TimeSpan? delay = null, CancellationToken cancellationToken = default);
-    /// <summary>Waits for the next job id (null on timeout).</summary>
-    Task<Guid?> DequeueAsync(TimeSpan wait, CancellationToken cancellationToken = default);
+    /// <summary>Waits for the next message (null on timeout). The caller settles it: complete, abandon or dead-letter.</summary>
+    Task<QueuedJobMessage?> DequeueAsync(TimeSpan wait, CancellationToken cancellationToken = default);
+}
+
+/// <summary>A received queue message. Settlement semantics follow Azure Service Bus (peek-lock).</summary>
+public sealed class QueuedJobMessage
+{
+    /// <summary>Null when the body is not a valid job id (poison message).</summary>
+    public Guid? JobId { get; init; }
+    public int DeliveryCount { get; init; } = 1;
+    public Func<Task> CompleteAsync { get; init; } = () => Task.CompletedTask;
+    /// <summary>Returns the message for redelivery (transient failure). After MaxDeliveryCount it is dead-lettered.</summary>
+    public Func<Task> AbandonAsync { get; init; } = () => Task.CompletedTask;
+    public Func<string, Task> DeadLetterAsync { get; init; } = _ => Task.CompletedTask;
 }
 
 /// <summary>

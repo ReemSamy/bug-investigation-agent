@@ -56,6 +56,13 @@ public sealed class InvestigationJob
     /// <summary>Latest non-secret chat reply from the invoking user, consumed by the worker.</summary>
     public string? PendingUserReply { get; set; }
     public bool CancelRequested { get; set; }
+    /// <summary>When the job started waiting for user input (Unix ms; 0 = not waiting). Drives the input timeout.</summary>
+    public long AwaitingSinceUnixMs { get; set; }
+    /// <summary>
+    /// Investigation state saved when the job is suspended for user input (JSON of the runtime context — contains no
+    /// secrets by design). The worker slot is released; the job resumes from this checkpoint on any worker.
+    /// </summary>
+    public string? ContextSnapshotJson { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? StartedAt { get; set; }

@@ -185,6 +185,21 @@ public sealed class EfInvestigationJobStore : IInvestigationJobStore
             .ToListAsync(cancellationToken);
     }
 
+    public async Task<IReadOnlyList<Guid>> ListExpiredAsync(long awaitingBeforeUnixMs, long createdBeforeUnixMs, int max, CancellationToken cancellationToken = default)
+    {
+        await using var db = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = Now;
+        return await db.InvestigationJobs.AsNoTracking()
+            .Where(j => j.Status != InvestigationJobStatus.Completed && j.Status != InvestigationJobStatus.Failed
+                        && j.Status != InvestigationJobStatus.Cancelled && j.Status != InvestigationJobStatus.TimedOut
+                        && (j.LeaseOwner == null || j.LeaseExpiresUnixMs < now)
+                        && ((j.Status == InvestigationJobStatus.AwaitingUserInput && j.AwaitingSinceUnixMs > 0 && j.AwaitingSinceUnixMs < awaitingBeforeUnixMs)
+                            || j.CreatedAtUnixMs < createdBeforeUnixMs))
+            .Select(j => j.Id)
+            .Take(max)
+            .ToListAsync(cancellationToken);
+    }
+
     public async Task UpsertInstallationAsync(JiraInstallation installation, CancellationToken cancellationToken = default)
     {
         await using var db = await _factory.CreateDbContextAsync(cancellationToken);

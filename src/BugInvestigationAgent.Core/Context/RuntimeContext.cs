@@ -62,6 +62,8 @@ public sealed class RuntimeContext
     /// <summary>User explicitly allowed potentially state-changing steps on a read-only environment.</summary>
     public bool StateChangingActionsConfirmed { get; set; }
     public IList<string> SkippedStateChangingSteps { get; set; } = new List<string>();
+    /// <summary>Browser requests blocked by the read-only guard ("POST /path"); no bodies or query strings.</summary>
+    public IList<string> BlockedBrowserRequests { get; set; } = new SynchronizedList<string>();
 
     // ── Authentication (no secrets here — only status) ─────────────────────
     public Authentication.AuthenticationStatus AuthenticationStatus { get; set; }

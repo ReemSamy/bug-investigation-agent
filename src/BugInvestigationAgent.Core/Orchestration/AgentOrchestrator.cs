@@ -23,6 +23,8 @@ public interface IAgentOrchestrator
     Task StartAsync(Guid sessionId, string jiraTicketOrUrl, string? workspacePath, CancellationToken cancellationToken = default);
     /// <summary>Runs the pipeline and completes when the investigation ends (hosted workers).</summary>
     Task RunAsync(Guid sessionId, string jiraTicketOrUrl, string? workspacePath, CancellationToken cancellationToken = default);
+    /// <summary>Continues a suspended investigation whose context was restored from a checkpoint (hosted workers).</summary>
+    Task ResumeAsync(Guid sessionId, CancellationToken cancellationToken = default);
     /// <summary>Cancels one investigation only.</summary>
     Task CancelAsync(Guid sessionId);
     Task SubmitMissingInfoAsync(Guid sessionId, IDictionary<string, string> values, CredentialSecret? newCredentials, bool saveCredentialProfile, CancellationToken cancellationToken = default);
@@ -80,6 +82,24 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
     {
         var (session, token) = PrepareRun(sessionId, jiraTicketOrUrl, workspacePath, cancellationToken);
         await ExecuteRunAsync(session, token);
+    }
+
+    public async Task ResumeAsync(Guid sessionId, CancellationToken cancellationToken = default)
+    {
+        var session = RequireSession(sessionId);
+        _sessionCredentials.Clear(session.Id);
+        CancellationTokenSource runCts;
+        lock (_runGate)
+        {
+            if (_runs.Remove(sessionId, out var previous))
+            {
+                previous.Cancel();
+                previous.Dispose();
+            }
+            runCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _runs[sessionId] = runCts;
+        }
+        await ExecuteRunAsync(session, runCts.Token, resume: true);
     }
 
     public Task CancelAsync(Guid sessionId)
@@ -143,13 +163,13 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         return (session, runCts.Token);
     }
 
-    private async Task ExecuteRunAsync(AgentSession session, CancellationToken token)
+    private async Task ExecuteRunAsync(AgentSession session, CancellationToken token, bool resume = false)
     {
         var sessionId = session.Id;
         try
         {
             using var scope = _scopeFactory.CreateScope();
-            await RunPipelineAsync(scope.ServiceProvider, session, token);
+            await RunPipelineAsync(scope.ServiceProvider, session, token, resume);
         }
         catch (OperationCanceledException)
         {
@@ -250,10 +270,14 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 (selection.Environment.IsProduction ? " — PRODUCTION: read-only investigation." : "."));
         }
 
-        if (ctx.IsReadOnlyEnvironment)
-            ctx.StateChangingActionsConfirmed = string.Equals(Value(values, "allowStateChangingActions"), "true", StringComparison.OrdinalIgnoreCase);
-
         var environment = _environments.ResolveSelected(ctx);
+        if (ctx.IsReadOnlyEnvironment)
+        {
+            // A user's tick only lifts read-only protection where an administrator explicitly allowed that.
+            ctx.StateChangingActionsConfirmed =
+                environment?.AllowUserConfirmedStateChanges == true &&
+                string.Equals(Value(values, "allowStateChangingActions"), "true", StringComparison.OrdinalIgnoreCase);
+        }
 
         // ── Credentials (environment-specific) ─────────────────────────────
         if (newCredentials is not null)
@@ -410,12 +434,19 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         session.NotifyChanged();
     }
 
-    private async Task RunPipelineAsync(IServiceProvider sp, AgentSession session, CancellationToken cancellationToken)
+    private async Task RunPipelineAsync(IServiceProvider sp, AgentSession session, CancellationToken cancellationToken, bool resume = false)
     {
         try
         {
             var vault = sp.GetRequiredService<ICredentialVault>();
 
+            if (resume)
+            {
+                // Resumed from a checkpoint: ticket analysis is already in the context; continue at the input gate.
+                session.Context.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Resuming investigation from its checkpoint.");
+            }
+            else
+            {
             session.SetState(AgentState.ReadingJira, "Fetching ticket details from Jira.");
             try
             {
@@ -444,8 +475,11 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
             session.SetState(AgentState.ExtractingContext, "Inferring environment, user/role, and URLs from the ticket.");
             await ExecuteSkillAsync(sp, SkillIds.EnvironmentDiscovery, session, cancellationToken);
 
+            }
+
             // Hosted mode: check out the mapped repository (read-only) so code investigation needs no local workspace.
-            if (IsRegistered(sp, SkillIds.SourceRepository))
+            // (Also after a resume on another worker, where the previous checkout no longer exists.)
+            if (IsRegistered(sp, SkillIds.SourceRepository) && !MissingInfoResolver.IsLocalWorkspace(session.Context.WorkspacePath))
             {
                 session.SetState(AgentState.ExtractingContext, "Locating the source repository for this ticket.");
                 await ExecuteSkillAsync(sp, SkillIds.SourceRepository, session, cancellationToken);
@@ -692,6 +726,15 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Signed in to {environment?.DisplayName}. {ctx.AuthenticationMessage}");
                 session.SetState(AgentState.ConnectingEnvironment, "Sign-in verified. Continuing with reproduction.");
                 return true;
+            }
+
+            if (ctx.AuthenticationStatus == AuthenticationStatus.VerificationNotConfigured)
+            {
+                await _browserSessions.CloseAsync(session.Id);
+                _sessionCredentials.Clear(session.Id);
+                session.LastError = ctx.AuthenticationMessage;
+                session.SetState(AgentState.Failed, $"Environment {environment?.DisplayName} needs setup: {ctx.AuthenticationMessage}");
+                return false;
             }
 
             var manualStep = ctx.AuthenticationStatus is AuthenticationStatus.MfaRequired or AuthenticationStatus.ManualInterventionRequired;

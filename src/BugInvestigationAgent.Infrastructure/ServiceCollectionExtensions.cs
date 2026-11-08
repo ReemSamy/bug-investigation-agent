@@ -12,6 +12,7 @@ using BugInvestigationAgent.Core.Repositories;
 using BugInvestigationAgent.Infrastructure.Credentials;
 using BugInvestigationAgent.Infrastructure.Evidence;
 using BugInvestigationAgent.Infrastructure.Forge;
+using BugInvestigationAgent.Infrastructure.Hosting;
 using BugInvestigationAgent.Infrastructure.Jobs;
 using BugInvestigationAgent.Infrastructure.Knowledge;
 using BugInvestigationAgent.Infrastructure.Memory;
@@ -130,7 +131,7 @@ public static class ServiceCollectionExtensions
                 ? agentOptions.DataDirectory
                 : Path.Combine(contentRoot, agentOptions.DataDirectory);
             Directory.CreateDirectory(dataDir);
-            options.UseSqlite($"Data Source={Path.Combine(dataDir, "agent.db")}");
+            options.UseSqlite($"Data Source={Path.Combine(dataDir, "agent.db")};Default Timeout=30");
         });
         if (hosting.IsPostgres)
         {
@@ -160,6 +161,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IInvestigationJobStore, EfInvestigationJobStore>();
         services.AddSingleton<IJobSecretStore, DataProtectionJobSecretStore>();
         services.AddSingleton<IAuditLog, EfAuditLog>();
+        services.AddSingleton<Hosting.JobInputService>();
         if (!string.IsNullOrWhiteSpace(hosting.ServiceBusNamespace))
         {
             services.AddSingleton(_ => new ServiceBusClient(hosting.ServiceBusNamespace, credential));
@@ -204,6 +206,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IKnowledgeRetriever>(sp => sp.GetRequiredService<MarkdownKnowledgeStore>());
         services.AddSingleton<IEmbeddingProvider, NullEmbeddingProvider>();
         services.AddHostedService<DatabaseInitializer>();
+        services.AddReadinessChecks(hosting);
         return services;
     }
 
@@ -214,6 +217,14 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddBugInvestigationHostedMode(this IServiceCollection services)
     {
         services.Replace(ServiceDescriptor.Singleton<IJiraConnectionSettings, HostedJiraConnectionSettings>());
+        // Identity = verified Atlassian user of the current job only; never the OS account.
+        services.Replace(ServiceDescriptor.Singleton<ICurrentUserAccessor, Hosting.HostedOnlyCurrentUserAccessor>());
+        // Read-only rollout enforced in code, independent of configuration.
+        services.Replace(ServiceDescriptor.Singleton<Core.Permissions.IPermissionGate>(sp =>
+        {
+            var configured = sp.GetRequiredService<IOptions<AgentOptions>>().Value.Permissions.ToFlags();
+            return Hosting.HostedPermissions.Mask(new Core.Permissions.PermissionGate(configured));
+        }));
         return services;
     }
 }
@@ -238,8 +249,8 @@ internal sealed class DatabaseInitializer : IHostedService
     {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AgentDbContext>();
-        await db.Database.EnsureCreatedAsync(cancellationToken);
-        await SchemaUpgrader.UpgradeAsync(db, cancellationToken);
+        // Versioned migrations (safe when several replicas start at once).
+        await DatabaseMigrator.MigrateAsync(db, cancellationToken);
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;

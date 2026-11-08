@@ -36,7 +36,9 @@ public sealed class PlaywrightSessionHub : IPlaywrightSessionHub, IAsyncDisposab
         {
             ViewportSize = new ViewportSize { Width = 1440, Height = 900 },
             // Do not let the browser offer to save the password or reuse anything from a profile.
-            AcceptDownloads = false
+            AcceptDownloads = false,
+            // Service workers could bypass request routing — block them so the read-only guard sees every request.
+            ServiceWorkers = ServiceWorkerPolicy.Block
         });
         var page = await context.NewPageAsync();
 
