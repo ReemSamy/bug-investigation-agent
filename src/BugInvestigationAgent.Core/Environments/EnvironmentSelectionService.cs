@@ -46,6 +46,9 @@ public interface IEnvironmentSelectionService
 
     /// <summary>Re-resolves the environment currently selected on the context (null when nothing valid is selected).</summary>
     AppEnvironment? ResolveSelected(RuntimeContext context);
+
+    /// <summary>Environment id named in a free-text reply (id, alias or display name). Null if none or ambiguous.</summary>
+    string? MatchEnvironmentReply(string? reply);
 }
 
 public sealed class EnvironmentSelectionService : IEnvironmentSelectionService
@@ -246,6 +249,19 @@ public sealed class EnvironmentSelectionService : IEnvironmentSelectionService
             ? ValidateAdHoc(context.EnvironmentUrl)
             : Validate(id);
         return result.IsValid ? result.Environment : null;
+    }
+
+    public string? MatchEnvironmentReply(string? reply)
+    {
+        if (string.IsNullOrWhiteSpace(reply))
+            return null;
+        var text = StripUrls(reply);
+        var matches = Registry.List()
+            .Where(e => new[] { e.Id, e.DisplayName }.Concat(e.Aliases).Any(t => ContainsToken(text, t)))
+            .Select(e => e.Id)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return matches.Count == 1 ? matches[0] : null;
     }
 
     private EnvironmentValidationResult ValidateAdHoc(string? url)

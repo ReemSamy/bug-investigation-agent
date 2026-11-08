@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bug Investigation Agent — secure input</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; color: #172b4d; margin: 0; padding: 16px; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p.note { color: #44546f; font-size: 13px; }
+    .card { border: 1px solid #dcdfe4; border-radius: 8px; padding: 16px; margin: 12px 0; max-width: 560px; }
+    label { display: block; font-size: 12px; font-weight: 600; margin: 10px 0 4px; }
+    input[type=text], input[type=password] { width: 100%; box-sizing: border-box; padding: 8px; border: 2px solid #dcdfe4; border-radius: 4px; }
+    .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 13px; }
+    button { margin-top: 12px; background: #0c66e4; color: #fff; border: 0; border-radius: 4px; padding: 8px 14px; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: default; }
+    .msg { margin-top: 8px; font-size: 13px; }
+    .ok { color: #216e4e; } .err { color: #ae2e24; }
+  </style>
+</head>
+<body>
+  <h1>Bug Investigation Agent — secure input</h1>
+  <p class="note">
+    Enter environment credentials or verification codes here — never in the Rovo chat.
+    They are sent directly from your browser to the agent service over HTTPS, used only for the investigation shown,
+    and are not stored unless you choose “Remember”.
+  </p>
+  <div id="app">Loading pending requests…</div>
+  <script src="./main.js"></script>
+</body>
+</html>

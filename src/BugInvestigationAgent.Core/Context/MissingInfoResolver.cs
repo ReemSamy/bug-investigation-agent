@@ -74,7 +74,8 @@ public sealed class MissingInfoResolver : IMissingInfoResolver
         if (!IsLocalWorkspace(context.WorkspacePath) && IsLocalWorkspace(_workspaceDefaults.DefaultWorkspacePath))
             context.WorkspacePath = _workspaceDefaults.DefaultWorkspacePath;
 
-        if (!IsLocalWorkspace(context.WorkspacePath))
+        var repositoryUnavailable = context.CustomFields.ContainsKey("repositoryMappingMissing");
+        if (!IsLocalWorkspace(context.WorkspacePath) && !repositoryUnavailable)
         {
             missing.Add(new MissingField
             {

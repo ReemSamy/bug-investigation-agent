@@ -2,6 +2,8 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using BugInvestigationAgent.Core.Configuration;
+using BugInvestigationAgent.Core.Context;
+using BugInvestigationAgent.Core.Jira;
 using Microsoft.Extensions.Logging;
 
 namespace BugInvestigationAgent.Skills.Jira;
@@ -9,30 +11,32 @@ namespace BugInvestigationAgent.Skills.Jira;
 public sealed class JiraIssueSearchClient : IJiraIssueSearchClient
 {
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly IJiraConnectionSettings _jira;
+    private readonly IJiraAccessProvider _access;
     private readonly ILogger<JiraIssueSearchClient> _logger;
 
     public JiraIssueSearchClient(
         IHttpClientFactory httpClientFactory,
-        IJiraConnectionSettings jira,
+        IJiraAccessProvider access,
         ILogger<JiraIssueSearchClient> logger)
     {
         _httpClientFactory = httpClientFactory;
-        _jira = jira;
+        _access = access;
         _logger = logger;
     }
 
-    public async Task<IReadOnlyList<JiraSearchHit>> SearchAsync(string jql, int maxResults, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<JiraSearchHit>> SearchAsync(string jql, int maxResults, CancellationToken cancellationToken = default) =>
+        SearchAsync(new RuntimeContext(), jql, maxResults, cancellationToken);
+
+    /// <summary>Searches with the investigation's Jira access (invoking user's token in hosted mode — results respect their permissions).</summary>
+    public async Task<IReadOnlyList<JiraSearchHit>> SearchAsync(RuntimeContext context, string jql, int maxResults, CancellationToken cancellationToken = default)
     {
-        if (!_jira.IsConfigured)
+        var accessResult = await _access.GetReadAccessAsync(context, cancellationToken);
+        if (accessResult.Access is null)
             return Array.Empty<JiraSearchHit>();
 
-        var options = _jira.GetEffective();
-        var baseUrl = JiraUrlNormalizer.NormalizeBaseUrl(options.BaseUrl).TrimEnd('/');
         var client = _httpClientFactory.CreateClient("jira");
-        client.BaseAddress = new Uri(baseUrl + "/");
-        var auth = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{options.Email}:{options.ApiToken}"));
-        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", auth);
+        client.BaseAddress = accessResult.Access.BaseAddress;
+        client.DefaultRequestHeaders.Authorization = accessResult.Access.Authorization;
         client.DefaultRequestHeaders.Accept.Clear();
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
@@ -61,7 +65,7 @@ public sealed class JiraIssueSearchClient : IJiraIssueSearchClient
             }
         }
 
-        return ParseHits(body, baseUrl);
+        return ParseHits(body, (accessResult.Access.BrowseBaseUrl ?? accessResult.Access.BaseAddress.ToString()).TrimEnd('/'));
     }
 
     private static IReadOnlyList<JiraSearchHit> ParseHits(string json, string baseUrl)

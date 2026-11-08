@@ -1,0 +1,86 @@
+# Atlassian Forge app: exposes the AI Bug Investigation Agent inside Jira Cloud as a Rovo remote agent
+# (rovo:agentConnector, A2A 1.0 over JSON-RPC) backed by our Azure-hosted API (Forge Remote).
+# Before `forge deploy`: run `forge register` (sets app.id) and replace REPLACE_WITH_API_HOST below.
+app:
+  id: ari:cloud:ecosystem::app/REPLACE_WITH_FORGE_APP_ID
+  runtime:
+    name: nodejs22.x
+
+modules:
+  rovo:agentConnector:
+    - key: bug-investigation-agent
+      name: Bug Investigation Agent
+      description: >-
+        Investigates Jira bugs: reads the ticket with your permissions, reproduces it on the environment you pick
+        (KMSRC, KMSQA, ...), analyses the Azure DevOps code read-only and posts an evidence-backed report.
+      icon: resource:agent-resources;icons/agent.svg
+      conversationStarters:
+        - Investigate this bug
+        - Reproduce this issue on KMSQA
+      productContexts:
+        - jira
+      protocols:
+        agent2Agent:
+          version: "1.0"
+          jsonRpcTransport:
+            endpoint: a2a-json-rpc-endpoint
+            streaming: false
+
+  trigger:
+    - key: installed-trigger
+      endpoint: installed-endpoint
+      events:
+        - avi:forge:installed:app
+        - avi:forge:upgraded:app
+
+  # Secure input page: environment credentials and MFA codes are entered here (never in Rovo chat) and posted
+  # directly from the user's browser to the agent backend with a one-time ticket.
+  jira:personalSettingsPage:
+    - key: agent-credentials-page
+      title: Bug Investigation Agent — secure input
+      resource: settings-page
+      resolver:
+        endpoint: credentials-endpoint
+
+  endpoint:
+    - key: a2a-json-rpc-endpoint
+      remote: agent-remote
+      route:
+        path: /a2a/json-rpc
+    - key: installed-endpoint
+      remote: agent-remote
+      route:
+        path: /atlassian/installed
+    # Custom UI resolver endpoint: the frontend passes the path in invokeRemote (no route needed).
+    - key: credentials-endpoint
+      remote: agent-remote
+
+remotes:
+  - key: agent-remote
+    baseUrl: https://REPLACE_WITH_API_HOST
+    operations:
+      - compute
+    auth:
+      appSystemToken:
+        enabled: true   # app-owned actions only: publishing the investigation report comment/screenshots
+      appUserToken:
+        enabled: true   # all reads of issues/comments/attachments run with the invoking user's permissions
+
+resources:
+  - key: agent-resources
+    path: static/agent
+  - key: settings-page
+    path: static/settings/build
+
+permissions:
+  scopes:
+    - read:jira-work        # read issues, comments, attachments (as the invoking user)
+    - read:jira-user        # /myself — identify the invoking user from their own token
+    - write:jira-work       # publish the report comment + masked screenshots (as the app)
+    - read:app-system-token
+    - read:app-user-token
+  external:
+    fetch:
+      client:
+        # Custom UI posts credentials directly to the backend (not through Forge functions).
+        - https://REPLACE_WITH_API_HOST

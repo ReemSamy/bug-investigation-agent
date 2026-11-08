@@ -53,4 +53,5 @@ public static class SkillIds
     public const string PullRequest = "pull-request";
     public const string CiCd = "ci-cd";
     public const string Deployment = "deployment";
+    public const string SourceRepository = "source-repository";
 }

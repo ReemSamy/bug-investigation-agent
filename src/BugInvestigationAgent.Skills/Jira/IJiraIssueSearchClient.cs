@@ -5,6 +5,7 @@ namespace BugInvestigationAgent.Skills.Jira;
 public interface IJiraIssueSearchClient
 {
     Task<IReadOnlyList<JiraSearchHit>> SearchAsync(string jql, int maxResults, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<JiraSearchHit>> SearchAsync(BugInvestigationAgent.Core.Context.RuntimeContext context, string jql, int maxResults, CancellationToken cancellationToken = default);
 }
 
 public sealed class JiraSearchHit

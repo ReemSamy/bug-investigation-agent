@@ -19,7 +19,12 @@ namespace BugInvestigationAgent.Core.Orchestration;
 
 public interface IAgentOrchestrator
 {
+    /// <summary>Starts the pipeline in the background (standalone UI).</summary>
     Task StartAsync(Guid sessionId, string jiraTicketOrUrl, string? workspacePath, CancellationToken cancellationToken = default);
+    /// <summary>Runs the pipeline and completes when the investigation ends (hosted workers).</summary>
+    Task RunAsync(Guid sessionId, string jiraTicketOrUrl, string? workspacePath, CancellationToken cancellationToken = default);
+    /// <summary>Cancels one investigation only.</summary>
+    Task CancelAsync(Guid sessionId);
     Task SubmitMissingInfoAsync(Guid sessionId, IDictionary<string, string> values, CredentialSecret? newCredentials, bool saveCredentialProfile, CancellationToken cancellationToken = default);
     Task ApproveFixAsync(Guid sessionId, bool approve, CancellationToken cancellationToken = default);
     Task SaveLessonAsync(Guid sessionId, string lesson, MemoryScope scope, IEnumerable<string>? tags, string? validatedBy, CancellationToken cancellationToken = default);
@@ -38,8 +43,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
     private readonly ISessionCredentialStore _sessionCredentials;
     private readonly ILogger<AgentOrchestrator> _logger;
     private readonly object _runGate = new();
-    private CancellationTokenSource? _activeRunCts;
-    private Guid? _activeRunSessionId;
+    private readonly Dictionary<Guid, CancellationTokenSource> _runs = new();
 
     public AgentOrchestrator(
         IServiceScopeFactory scopeFactory,
@@ -67,6 +71,31 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
 
     public Task StartAsync(Guid sessionId, string jiraTicketOrUrl, string? workspacePath, CancellationToken cancellationToken = default)
     {
+        var (session, token) = PrepareRun(sessionId, jiraTicketOrUrl, workspacePath, cancellationToken);
+        _ = Task.Run(() => ExecuteRunAsync(session, token), CancellationToken.None);
+        return Task.CompletedTask;
+    }
+
+    public async Task RunAsync(Guid sessionId, string jiraTicketOrUrl, string? workspacePath, CancellationToken cancellationToken = default)
+    {
+        var (session, token) = PrepareRun(sessionId, jiraTicketOrUrl, workspacePath, cancellationToken);
+        await ExecuteRunAsync(session, token);
+    }
+
+    public Task CancelAsync(Guid sessionId)
+    {
+        CancellationTokenSource? cts;
+        lock (_runGate)
+            _runs.TryGetValue(sessionId, out cts);
+        try { cts?.Cancel(); } catch (ObjectDisposedException) { }
+        var session = _sessions.Get(sessionId);
+        session?.MissingInfoWaiter?.TrySetResult(false);
+        session?.ApprovalWaiter?.TrySetResult(false);
+        return Task.CompletedTask;
+    }
+
+    private (AgentSession Session, CancellationToken Token) PrepareRun(Guid sessionId, string jiraTicketOrUrl, string? workspacePath, CancellationToken cancellationToken)
+    {
         var session = RequireSession(sessionId);
         var path = string.IsNullOrWhiteSpace(workspacePath) ? _workspaceDefaults.DefaultWorkspacePath : workspacePath;
         session.Context.WorkspacePath = string.IsNullOrWhiteSpace(path) ? session.Context.WorkspacePath : path;
@@ -83,6 +112,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         session.Context.ProposedFiles.Clear();
         session.Context.FinalStatusMessage = null;
         session.Context.Investigation.Clear();
+        session.Context.CodeCorrelation.Clear();
         session.Context.CustomFields.Remove("stepsInferredFromTicket");
         session.Context.CustomFields.Remove("inferredForTicket");
         session.Context.CustomFields.Remove("stepsFromJira");
@@ -95,47 +125,48 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         ResetEnvironmentAndAuthentication(session.Context);
         _sessionCredentials.Clear(session.Id);
         session.Context.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Starting fresh investigation for {session.Context.JiraTicketKey}.");
-        _redactor.ClearSessionSecrets();
+        _redactor.ClearSessionSecrets(session.Id);
 
+        // One cancellation source PER investigation: starting or cancelling one never affects another user's run.
         CancellationTokenSource runCts;
         lock (_runGate)
         {
-            _activeRunCts?.Cancel();
-            _activeRunCts?.Dispose();
-            _activeRunCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            runCts = _activeRunCts;
-            _activeRunSessionId = sessionId;
+            if (_runs.Remove(sessionId, out var previous))
+            {
+                previous.Cancel();
+                previous.Dispose();
+            }
+            runCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _runs[sessionId] = runCts;
         }
 
-        var token = runCts.Token;
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                using var scope = _scopeFactory.CreateScope();
-                await RunPipelineAsync(scope.ServiceProvider, session, token);
-            }
-            catch (OperationCanceledException)
-            {
-                session.Context.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Previous/canceled run stopped so a new ticket can be investigated.");
-                session.NotifyChanged();
-            }
-            finally
-            {
-                await _browserSessions.CloseAsync(sessionId);
-                _sessionCredentials.Clear(sessionId);
-                lock (_runGate)
-                {
-                    if (_activeRunSessionId == sessionId)
-                    {
-                        _activeRunCts = null;
-                        _activeRunSessionId = null;
-                    }
-                }
-            }
-        }, CancellationToken.None);
+        return (session, runCts.Token);
+    }
 
-        return Task.CompletedTask;
+    private async Task ExecuteRunAsync(AgentSession session, CancellationToken token)
+    {
+        var sessionId = session.Id;
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            await RunPipelineAsync(scope.ServiceProvider, session, token);
+        }
+        catch (OperationCanceledException)
+        {
+            session.Context.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Investigation run was cancelled.");
+            session.NotifyChanged();
+        }
+        finally
+        {
+            await _browserSessions.CloseAsync(sessionId);
+            _sessionCredentials.Clear(sessionId);
+            _redactor.ClearSessionSecrets(sessionId);
+            lock (_runGate)
+            {
+                if (_runs.Remove(sessionId, out var cts))
+                    cts.Dispose();
+            }
+        }
     }
 
     public async Task SubmitMissingInfoAsync(
@@ -164,6 +195,14 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         if (string.Equals(authAction, "recheck", StringComparison.OrdinalIgnoreCase)
             && ctx.AuthenticationStatus is AuthenticationStatus.MfaRequired or AuthenticationStatus.ManualInterventionRequired)
         {
+            // Optional one-time verification code: typed into the open MFA page by the browser skill, never logged.
+            var mfaCode = Value(values, "mfaCode");
+            if (mfaCode is not null && ctx.SelectedEnvironmentId is { } mfaEnv)
+            {
+                _redactor.RegisterSecret(mfaCode, session.Id);
+                _sessionCredentials.Set(session.Id, MfaCredentialKey(mfaEnv), new CredentialSecret { Username = "", Password = mfaCode });
+            }
+
             ctx.AuthenticationRecheckRequested = true;
             await _missingInfoResolver.ResolveAsync(ctx, vault, cancellationToken);
             ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} User reports the additional sign-in step is complete — re-checking.");
@@ -237,8 +276,8 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 return;
             }
 
-            _redactor.RegisterSecret(newCredentials.Password);
-            _redactor.RegisterSecret(newCredentials.Token);
+            _redactor.RegisterSecret(newCredentials.Password, session.Id);
+            _redactor.RegisterSecret(newCredentials.Token, session.Id);
             _sessionCredentials.Set(session.Id, environment.Id, newCredentials);
             ctx.CredentialProfileId = null;
             ctx.Username = newCredentials.Username;
@@ -404,6 +443,13 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
 
             session.SetState(AgentState.ExtractingContext, "Inferring environment, user/role, and URLs from the ticket.");
             await ExecuteSkillAsync(sp, SkillIds.EnvironmentDiscovery, session, cancellationToken);
+
+            // Hosted mode: check out the mapped repository (read-only) so code investigation needs no local workspace.
+            if (IsRegistered(sp, SkillIds.SourceRepository))
+            {
+                session.SetState(AgentState.ExtractingContext, "Locating the source repository for this ticket.");
+                await ExecuteSkillAsync(sp, SkillIds.SourceRepository, session, cancellationToken);
+            }
             await _missingInfoResolver.ResolveAsync(session.Context, vault, cancellationToken);
             session.Context.StatusLog.Add(
                 $"{DateTimeOffset.UtcNow:HH:mm:ss} Missing info: {session.Context.MissingFields.Count} field(s) — {session.Context.MissingInfoReason ?? "ready"}.");
@@ -523,6 +569,15 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                     return;
             }
 
+            if (!MissingInfoResolver.IsLocalWorkspace(session.Context.WorkspacePath))
+            {
+                await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
+                session.Context.FinalStatusMessage =
+                    $"Reproduced {session.Context.JiraTicketKey}, but no source repository is mapped/available, so no code investigation was done.";
+                session.SetState(AgentState.Completed, session.Context.FinalStatusMessage);
+                return;
+            }
+
             session.SetState(AgentState.Investigating, "Locating root cause in the workspace.");
             var tags = new List<string>();
             if (!string.IsNullOrWhiteSpace(session.Context.SystemName))
@@ -539,6 +594,16 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 session.Context.FinalStatusMessage =
                     "Reproduction finished, but no code fix was proposed because no LLM API key is configured. " +
                     "Add OpenAI/Anthropic in Sign in / Account, then Analyze again. Review Evidence screenshots meanwhile.";
+                session.SetState(AgentState.Completed, session.Context.FinalStatusMessage);
+                return;
+            }
+
+            if (!_permissions.IsAllowed(AgentPermission.ModifyCode))
+            {
+                // Read-only rollout: report the proposal for human review; never wait for an approval that cannot apply code.
+                await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
+                session.Context.FinalStatusMessage =
+                    $"Investigation of {session.Context.JiraTicketKey} complete (read-only): fix proposal included for human review; no code was modified.";
                 session.SetState(AgentState.Completed, session.Context.FinalStatusMessage);
                 return;
             }
@@ -662,6 +727,9 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         }
     }
 
+    private static bool IsRegistered(IServiceProvider sp, string skillId) =>
+        sp.GetRequiredService<IEnumerable<ISkill>>().Any(s => string.Equals(s.SkillId, skillId, StringComparison.OrdinalIgnoreCase));
+
     private async Task ExecuteSkillAsync(IServiceProvider sp, string skillId, AgentSession session, CancellationToken cancellationToken) =>
         await ExecuteSkillAsync(sp, skillId, session, null, cancellationToken);
 
@@ -747,6 +815,9 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
             }
         }
     }
+
+    /// <summary>Session-credential key under which a one-time MFA code is handed to the browser skill.</summary>
+    public static string MfaCredentialKey(string environmentId) => "MFA:" + environmentId;
 
     private static string? Value(IDictionary<string, string> values, string key)
     {

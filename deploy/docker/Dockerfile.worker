@@ -1,0 +1,22 @@
+# Background investigation worker: Playwright (Chromium), git (read-only Azure DevOps checkouts), .NET 8.
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet publish src/BugInvestigationAgent.Worker/BugInvestigationAgent.Worker.csproj -c Release -o /app /p:UseAppHost=false
+
+# Playwright image pinned to the Microsoft.Playwright package version (1.49) — browsers + OS deps preinstalled.
+FROM mcr.microsoft.com/playwright/dotnet:v1.49.0-noble
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 agent \
+    && mkdir -p /data/evidence /data/checkouts && chown -R agent /data
+WORKDIR /app
+COPY --from=build /app .
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_ENVIRONMENT=Production \
+    Agent__DataDirectory=/data \
+    Agent__EvidenceDirectory=/data/evidence \
+    Agent__Browser__Headless=true \
+    Repositories__CheckoutRoot=/data/checkouts
+USER agent
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "BugInvestigationAgent.Worker.dll"]

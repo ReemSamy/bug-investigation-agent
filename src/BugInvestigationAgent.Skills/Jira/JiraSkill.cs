@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using BugInvestigationAgent.Core.Configuration;
 using BugInvestigationAgent.Core.Context;
+using BugInvestigationAgent.Core.Jira;
 using BugInvestigationAgent.Core.Permissions;
 using BugInvestigationAgent.Core.Skills;
 using Microsoft.Extensions.Logging;
@@ -13,18 +14,18 @@ namespace BugInvestigationAgent.Skills.Jira;
 public sealed class JiraSkill : ISkill
 {
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly IJiraConnectionSettings _jira;
+    private readonly IJiraAccessProvider _access;
     private readonly AgentOptions _agentOptions;
     private readonly ILogger<JiraSkill> _logger;
 
     public JiraSkill(
         IHttpClientFactory httpClientFactory,
-        IJiraConnectionSettings jira,
+        IJiraAccessProvider access,
         Microsoft.Extensions.Options.IOptions<AgentOptions> agentOptions,
         ILogger<JiraSkill> logger)
     {
         _httpClientFactory = httpClientFactory;
-        _jira = jira;
+        _access = access;
         _agentOptions = agentOptions.Value;
         _logger = logger;
     }
@@ -44,24 +45,24 @@ public sealed class JiraSkill : ISkill
 
         request.Progress?.Report($"Loading issue {key} from Jira.");
 
-        if (!_jira.IsConfigured)
+        // Standalone: the configured API account. Hosted (Jira/Forge): the INVOKING USER's token, so Jira itself
+        // enforces that user's issue, comment and attachment permissions.
+        var accessResult = await _access.GetReadAccessAsync(request.Context, cancellationToken);
+        if (accessResult.Access is null)
         {
             request.Context.JiraDetailsLoaded = false;
-            return SkillResult.Fail(
-                "Jira is not configured. Open Settings once, enter Base URL / Email / API token, then analyze the ticket again.");
+            return SkillResult.Fail("Jira " + (accessResult.Error ?? "access is not available."));
         }
 
-        var options = _jira.GetEffective();
-        var baseUrl = JiraUrlNormalizer.NormalizeBaseUrl(options.BaseUrl);
-        if (string.IsNullOrWhiteSpace(baseUrl))
-            return SkillResult.Fail("Jira Base URL is empty. Use only the site root, e.g. https://ehsq.atlassian.net.");
+        var access = accessResult.Access;
+        var baseUrl = access.BaseAddress.ToString().TrimEnd('/');
+        var accountHint = access.IsUserDelegated ? "the invoking Jira user" : access.Description;
 
         try
         {
             var client = _httpClientFactory.CreateClient("jira");
-            client.BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/");
-            var auth = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{options.Email}:{options.ApiToken}"));
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", auth);
+            client.BaseAddress = access.BaseAddress;
+            client.DefaultRequestHeaders.Authorization = access.Authorization;
             client.DefaultRequestHeaders.Accept.Clear();
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
@@ -74,8 +75,10 @@ public sealed class JiraSkill : ISkill
                 {
                     request.Context.JiraDetailsLoaded = false;
                     return SkillResult.Fail(
-                        $"Jira login failed (HTTP {(int)myself.StatusCode}) for email '{options.Email}'. " +
-                        "Create a new API token at id.atlassian.com for that exact email (not your Visium app password), paste it in Settings, Save, then Analyze again.");
+                        $"Jira login failed (HTTP {(int)myself.StatusCode}) for {accountHint}. " +
+                        (access.IsUserDelegated
+                            ? "The Jira authorization may have expired — reply in the agent task or invoke the agent again."
+                            : "Create a new API token at id.atlassian.com for that exact email (not your Visium app password), paste it in Settings, Save, then Analyze again."));
                 }
                 if (myselfBody.TrimStart().StartsWith('<'))
                 {
@@ -116,6 +119,7 @@ public sealed class JiraSkill : ISkill
             }
 
             ParseIssue(request.Context, json);
+            CaptureIdAndComponents(request.Context, json);
             request.Context.JiraDetailsLoaded = true;
             request.Progress?.Report(
                 $"Loaded {key}: envUrl={(request.Context.EnvironmentUrl ?? "pending discovery")}, fixVersion={request.Context.FixVersion ?? "?"}, steps={request.Context.ReproductionSteps.Count}, attachments={request.Context.Attachments.Count}.");
@@ -347,7 +351,10 @@ public sealed class JiraSkill : ISkill
         {
             try
             {
-                using var resp = await client.GetAsync(att.Url, cancellationToken);
+                var downloadPath = string.IsNullOrWhiteSpace(att.Id)
+                    ? att.Url
+                    : $"rest/api/3/attachment/content/{Uri.EscapeDataString(att.Id)}";
+                using var resp = await client.GetAsync(downloadPath, cancellationToken);
                 if (!resp.IsSuccessStatusCode)
                     continue;
 
@@ -380,6 +387,27 @@ public sealed class JiraSkill : ISkill
     /// If the ticket/comments link an Azure DevOps or GitHub PR, record it as a fix reference —
     /// never as the portal EnvironmentUrl.
     /// </summary>
+    private static void CaptureIdAndComponents(RuntimeContext context, string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("id", out var id))
+                context.JiraIssueId = id.GetString();
+            context.Components.Clear();
+            if (doc.RootElement.TryGetProperty("fields", out var fields) &&
+                fields.TryGetProperty("components", out var comps) && comps.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var c in comps.EnumerateArray())
+                    if (c.TryGetProperty("name", out var n) && n.GetString() is { Length: > 0 } name)
+                        context.Components.Add(name);
+            }
+        }
+        catch (JsonException)
+        {
+        }
+    }
+
     internal static void CaptureFixPullRequestReference(RuntimeContext context, IProgress<string>? progress = null)
     {
         var corpus = string.Join('\n',

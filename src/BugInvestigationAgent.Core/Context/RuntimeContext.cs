@@ -31,6 +31,15 @@ public sealed class RuntimeContext
     public string? Role { get; set; }
     public string? WorkspacePath { get; set; }
 
+    /// <summary>Jira numeric issue id (hosted mode).</summary>
+    public string? JiraIssueId { get; set; }
+    /// <summary>Jira components of the issue (used for repository mapping).</summary>
+    public IList<string> Components { get; set; } = new List<string>();
+    /// <summary>Code correlation lines (commits mentioning the ticket, code-search hits). No secrets.</summary>
+    public IList<string> CodeCorrelation { get; set; } = new List<string>();
+    /// <summary>Repository investigated (display only).</summary>
+    public string? RepositoryDisplay { get; set; }
+
     /// <summary>Investigation identifier (one per Analyze); evidence is filed under it.</summary>
     public Guid InvestigationId => SessionId;
 
@@ -71,7 +80,7 @@ public sealed class RuntimeContext
 
     public Workflow.ReproductionOutcome ReproductionOutcome { get; set; }
     public string? ReproductionNotes { get; set; }
-    public IList<EvidenceItem> Evidence { get; set; } = new List<EvidenceItem>();
+    public IList<EvidenceItem> Evidence { get; set; } = new SynchronizedList<EvidenceItem>();
 
     public string? RootCause { get; set; }
     public string? ProposedFixSummary { get; set; }
@@ -84,7 +93,7 @@ public sealed class RuntimeContext
     public bool RetestPassed { get; set; }
     public string? FinalStatusMessage { get; set; }
 
-    public IList<string> StatusLog { get; set; } = new List<string>();
+    public IList<string> StatusLog { get; set; } = new SynchronizedList<string>();
     public IList<string> AppliedMemoryLessonIds { get; set; } = new List<string>();
 
     /// <summary>

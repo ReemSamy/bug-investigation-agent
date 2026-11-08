@@ -91,6 +91,30 @@ public sealed class LoginFlow
         return await WaitForOutcomeAsync(page, o, cancellationToken);
     }
 
+    /// <summary>
+    /// Types a one-time verification code (relayed by the user through a secure channel) into the open MFA page,
+    /// submits it and verifies the outcome. The code is never logged.
+    /// </summary>
+    public async Task<AuthenticationResult> SubmitMfaCodeAsync(ILoginPage page, LoginFormOptions options, string code, CancellationToken cancellationToken = default)
+    {
+        var o = options.WithDefaults();
+        var otpSelectors = o.MfaSelectors.Concat(["input[autocomplete='one-time-code']", "input[inputmode='numeric']"]).Distinct().ToList();
+        var field = await page.FindVisibleAsync(otpSelectors, cancellationToken);
+        if (field is null)
+            return AuthenticationResult.Of(AuthenticationStatus.ManualInterventionRequired,
+                "No verification-code field is visible. Approve the sign-in on your device instead, then re-check.", SafeUrl(page.Url));
+
+        await field.FillAsync(code.Trim(), cancellationToken);
+        var submit = await page.FindVisibleAsync(o.SubmitSelectors.Concat(["button:has-text('Verify')", "button:has-text('Continue')"]).ToList(), cancellationToken);
+        if (submit is not null)
+            await submit.ClickAsync(cancellationToken);
+        else
+            await field.PressAsync("Enter", cancellationToken);
+
+        await page.WaitForSettledAsync(cancellationToken);
+        return await WaitForOutcomeAsync(page, o, cancellationToken);
+    }
+
     /// <summary>Re-evaluates the current page, e.g. after the user completed an MFA step in a headed browser.</summary>
     public async Task<AuthenticationResult> RecheckAsync(ILoginPage page, LoginFormOptions options, CancellationToken cancellationToken = default)
     {

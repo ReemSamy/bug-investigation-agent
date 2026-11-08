@@ -60,7 +60,7 @@ public sealed class HistoricalJiraSearchSkill : ISkill
         IReadOnlyList<JiraSearchHit> hits;
         try
         {
-            hits = await _search.SearchAsync(jql, _options.MaxCandidates, cancellationToken);
+            hits = await _search.SearchAsync(ctx, jql, _options.MaxCandidates, cancellationToken);
         }
         catch (Exception ex)
         {

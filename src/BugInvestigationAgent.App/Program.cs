@@ -23,7 +23,7 @@ builder.Services.AddRazorComponents()
 builder.Services.AddBugInvestigationCore();
 builder.Services.AddBugInvestigationProviders();
 builder.Services.AddBugInvestigationSkills();
-builder.Services.AddBugInvestigationInfrastructure(builder.Environment.ContentRootPath);
+builder.Services.AddBugInvestigationInfrastructure(builder.Environment.ContentRootPath, builder.Configuration);
 
 var app = builder.Build();
 

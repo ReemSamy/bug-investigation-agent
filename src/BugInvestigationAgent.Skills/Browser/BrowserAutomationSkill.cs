@@ -105,8 +105,8 @@ public sealed class BrowserAutomationSkill : ISkill
                     $"Credentials for {env.DisplayName} are required before the agent can sign in.");
             }
 
-            _redactor.RegisterSecret(secret.Password);
-            _redactor.RegisterSecret(secret.Token);
+            _redactor.RegisterSecret(secret.Password, ctx.InvestigationId);
+            _redactor.RegisterSecret(secret.Token, ctx.InvestigationId);
         }
 
         try
@@ -179,8 +179,19 @@ public sealed class BrowserAutomationSkill : ISkill
     {
         try
         {
-            progress?.Report($"Re-checking sign-in state on {env.DisplayName}.");
-            var result = await _loginFlow.RecheckAsync(new PlaywrightLoginPage(page, _options.Browser), env.Login, cancellationToken);
+            var loginPage = new PlaywrightLoginPage(page, _options.Browser);
+            var mfa = _sessionCredentials.Take(ctx.InvestigationId, BugInvestigationAgent.Core.Orchestration.AgentOrchestrator.MfaCredentialKey(env.Id));
+            AuthenticationResult result;
+            if (!string.IsNullOrEmpty(mfa?.Password))
+            {
+                progress?.Report($"Submitting the verification code on {env.DisplayName}.");
+                result = await _loginFlow.SubmitMfaCodeAsync(loginPage, env.Login, mfa.Password!, cancellationToken);
+            }
+            else
+            {
+                progress?.Report($"Re-checking sign-in state on {env.DisplayName}.");
+                result = await _loginFlow.RecheckAsync(loginPage, env.Login, cancellationToken);
+            }
             return await ApplyResultAsync(ctx, env, page, result, progress);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

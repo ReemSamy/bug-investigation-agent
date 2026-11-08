@@ -28,6 +28,9 @@ public static class ServiceCollectionExtensions
             return new PermissionGate(options.Permissions.ToFlags());
         });
         services.AddSingleton<IAgentOrchestrator, AgentOrchestrator>();
+        services.AddSingleton<Jira.IJiraAccessProvider, Jira.ConfiguredJiraAccessProvider>();
+        services.AddOptions<Repositories.RepositoryMappingOptions>();
+        services.AddSingleton<Repositories.IRepositoryResolver, Repositories.ConfiguredRepositoryResolver>();
         return services;
     }
 }

@@ -1,0 +1,16 @@
+{
+  "name": "bug-investigation-agent-forge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Forge app (Rovo remote agent + secure input page) for the AI Bug Investigation Agent",
+  "scripts": {
+    "build": "esbuild static/settings/src/main.js --bundle --minify --format=iife --outfile=static/settings/build/main.js && node -e \"require('fs').copyFileSync('static/settings/src/index.html','static/settings/build/index.html')\"",
+    "lint": "forge lint"
+  },
+  "dependencies": {
+    "@forge/bridge": "^4.5.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}

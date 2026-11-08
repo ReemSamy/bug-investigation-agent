@@ -608,6 +608,9 @@
         _busy = true;
         try
         {
+            // Only this browser's previous run is cancelled — other users' investigations are unaffected.
+            if (_session is not null)
+                await Orchestrator.CancelAsync(_session.Id);
             Detach();
             ClearCredentialInputs();
             _selectedEnvironmentId = "";
