@@ -114,6 +114,7 @@ public sealed class JiraIssueSearchClient : IJiraIssueSearchClient
             JsonValueKind.Null => null,
             JsonValueKind.String => el.GetString(),
             JsonValueKind.Array => string.Join("\n", el.EnumerateArray().Select(ExtractText).Where(s => !string.IsNullOrWhiteSpace(s))),
+            JsonValueKind.Object when AdfText.IsAdf(el) => AdfText.ToPlainText(el),
             JsonValueKind.Object when el.TryGetProperty("content", out var content) => ExtractText(content),
             JsonValueKind.Object when el.TryGetProperty("text", out var text) => text.GetString(),
             JsonValueKind.Object => el.ToString(),

@@ -133,6 +133,25 @@ public sealed class ReproductionSkill : ISkill
                         continue;
                     }
 
+                    if (TicketStepPlanner.IsManualStep(step))
+                    {
+                        // The agent cannot fill forms, wait for schedulers or read mailboxes yet: stop honestly here.
+                        var remaining = steps.Skip(stepIndex - 1).Where(TicketStepPlanner.IsManualStep).ToList();
+                        ctx.CustomFields["manualStepsRemaining"] = remaining.Count.ToString();
+                        request.Progress?.Report(
+                            $"Step {stepIndex}/{steps.Count} needs a person — automation stops here. Remaining manual step(s): " +
+                            string.Join(" | ", remaining.Select(s => _redactor.Redact(s))));
+                        ctx.Evidence.Add(EvidenceItem.For(ctx, "note", null,
+                            $"Automation stopped at step {stepIndex}. These ticket steps must be done by a person (not automated yet): " +
+                            string.Join(" | ", remaining.Select(s => _redactor.Redact(s))),
+                            EvidenceCategories.Note));
+                        await EvidenceScreenshots.CaptureAsync(page, _options, ctx,
+                            $"{(isRetest ? "retest" : "repro")}-step-{stepIndex:00}-manual",
+                            $"Where automation stopped (before manual step {stepIndex}): {_redactor.Redact(step)}",
+                            EvidenceCategories.Workflow, login);
+                        break;
+                    }
+
                     request.Progress?.Report($"Step {stepIndex}/{steps.Count}: {step}");
                     var before = previousFingerprint;
                     var stepOk = true;
@@ -596,7 +615,7 @@ public sealed class ReproductionSkill : ISkill
 
         var ticketNamed = Regex.Match(text, @"^(?i)open\s+['""](.+?)['""]\s+from the application UI");
         if (ticketNamed.Success)
-            return await ClickBestAsync(page, ExpandLabels(ticketNamed.Groups[1].Value), timing);
+            return await FindInApplicationAsync(page, ticketNamed.Groups[1].Value, timing, progress);
 
         var nextNav = Regex.Match(text, @"^(?i)open\s+['""](.+?)['""]\s+\(next navigation");
         if (nextNav.Success)
@@ -894,6 +913,58 @@ public sealed class ReproductionSkill : ISkill
 
     private static Task<bool> ClickBestAsync(IPage page, IEnumerable<string> labels, BrowserTimingOptions timing) =>
         ClickBestAsync(page, labels, timing, preferSidePanel: false);
+
+    /// <summary>
+    /// Looks for a feature named in the ticket (e.g. "Badgermail") across the application, the way a tester would:
+    /// the current page, then the Modules and Administration menus, then the application's own search box.
+    /// Read-only: it only opens menus, follows links and types into a search field.
+    /// </summary>
+    private static async Task<bool> FindInApplicationAsync(IPage page, string name, BrowserTimingOptions timing, IProgress<string>? progress)
+    {
+        var labels = ExpandLabels(name).ToList();
+        progress?.Report($"Looking for '{name}' on the current page…");
+        if (await ClickBestAsync(page, labels, timing))
+            return true;
+
+        foreach (var menu in new[] { "Modules", "Administration" })
+        {
+            progress?.Report($"'{name}' not visible — looking inside {menu}…");
+            if (!await ClickBestAsync(page, menu == "Modules" ? new[] { "Modules", "Module" } : new[] { "Administration", "Admin" }, timing))
+                continue;
+            await page.WaitForTimeoutAsync(timing.PostActionDelayMs);
+            if (await ClickBestAsync(page, labels, timing))
+            {
+                progress?.Report($"Found '{name}' under {menu}.");
+                return true;
+            }
+            await page.Keyboard.PressAsync("Escape");
+        }
+
+        var search = page.Locator(
+            "input[type='search'], input[placeholder*='search' i], input[aria-label*='search' i], input[name*='search' i], input[id*='search' i]");
+        try
+        {
+            if (await search.CountAsync() > 0 && await search.First.IsVisibleAsync())
+            {
+                progress?.Report($"Searching the application for '{name}'…");
+                await search.First.FillAsync(name, new LocatorFillOptions { Timeout = timing.ActionTimeoutMs });
+                await search.First.PressAsync("Enter");
+                await page.WaitForTimeoutAsync(timing.PostActionDelayMs);
+                if (await ClickBestAsync(page, labels, timing))
+                {
+                    progress?.Report($"Found '{name}' through the application search.");
+                    return true;
+                }
+            }
+        }
+        catch (PlaywrightException)
+        {
+            // Search box not usable — fall through to "not found".
+        }
+
+        progress?.Report($"Could not find '{name}' on the page, in Modules, in Administration or via search.");
+        return false;
+    }
 
     /// <summary>
     /// Fast UI click: probe visible controls quickly. Never waits the full action timeout per missing label

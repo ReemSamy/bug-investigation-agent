@@ -28,7 +28,7 @@ public static class TicketStepPlanner
     {
         if (ctx.CustomFields.ContainsKey("stepsFromJira") && ctx.ReproductionSteps.Count > 0)
         {
-            var fromJira = ExpandAllSteps(ctx.ReproductionSteps);
+            var fromJira = PrepareTicketSteps(ctx.ReproductionSteps, ctx.Summary, ctx.Description);
             // Always keep going to the defect observation — tickets often end before Expected/Actual.
             EnsureObserveStep(fromJira, DescribeDefect(ctx.Summary, ctx.Description));
             ctx.ReproductionSteps = fromJira;
@@ -56,7 +56,7 @@ public static class TicketStepPlanner
 
     public static IReadOnlyList<string> InferFromTicket(RuntimeContext ctx)
     {
-        var summary = ctx.Summary ?? "";
+        var summary = StripVersionTags(ctx.Summary);
         var description = ctx.Description ?? "";
         var corpus = $"{summary}\n{description}";
         var defect = DescribeDefect(summary, description);
@@ -65,7 +65,7 @@ public static class TicketStepPlanner
         var jiraSteps = JiraSkill.ExtractSteps(description);
         if (jiraSteps.Count > 0)
         {
-            var expanded = ExpandAllSteps(jiraSteps);
+            var expanded = PrepareTicketSteps(jiraSteps, summary, description);
             // Incomplete Jira paths (e.g. stop on Persons list) must still drill into the defect UI.
             if (LooksLikeMultiSelectAssigneeTypingDefect(corpus))
                 EnsureMultiSelectAssigneeInteraction(expanded, defect, corpus);
@@ -128,6 +128,78 @@ public static class TicketStepPlanner
         return Deduplicate(steps);
     }
 
+    public const string ManualStepPrefix = "Manual step (not automated";
+
+    /// <summary>
+    /// Turns the ticket's own "Steps to reproduce" into browser actions:
+    /// • starts in the module the ticket talks about (e.g. "MOC" → Modules → MOC) when step 1 does not navigate;
+    /// • "Create a new record" → Create New;
+    /// • steps that need data entry, waiting or checking e-mail/notifications are marked manual — the agent stops
+    ///   there and reports them instead of clicking text that is not a control.
+    /// </summary>
+    public static List<string> PrepareTicketSteps(IEnumerable<string> rawSteps, string? summary, string? description)
+    {
+        var result = new List<string>();
+        foreach (var raw in rawSteps)
+        {
+            var step = CleanLabel(raw);
+            if (string.IsNullOrWhiteSpace(step))
+                continue;
+            var manual = ManualReason(step);
+            if (manual is not null)
+                result.Add($"{ManualStepPrefix} — {manual}): {step}");
+            else if (Regex.IsMatch(step, @"(?i)^(?:create|add|open)\s+(?:a\s+|an\s+)?new\s+(?:record|item|entry)\b|^create\s+(?:a\s+)?record\b"))
+                result.Add("Click Create New (or Add) in Record Options to open the new record form");
+            else
+                result.AddRange(ExpandOneStep(step));
+        }
+
+        if (result.Count > 0 && !StartsWithNavigation(result[0]))
+        {
+            var area = MentionedModulesArea($"{description}\n{StripVersionTags(summary)}");
+            if (area is not null)
+                result.InsertRange(0, new[] { "Open Modules menu", $"Open module '{area}'" });
+            else
+                result.InsertRange(0, BuildEntrySteps(ResolveEntryPoint(summary ?? "", $"{summary}\n{description}")));
+        }
+
+        return Deduplicate(result);
+    }
+
+    public static bool IsManualStep(string step) => step.StartsWith(ManualStepPrefix, StringComparison.OrdinalIgnoreCase);
+
+    private static string? ManualReason(string step)
+    {
+        if (Regex.IsMatch(step, @"(?i)\bwait\b|\bminutes?\b|\bhours?\b|\bovernight\b|\bnext day\b"))
+            return "needs waiting time";
+        if (Regex.IsMatch(step, @"(?i)\b(e-?mail|badger\s*mail|notification|inbox|mailbox)\b"))
+            return "needs the e-mail / notification to be checked";
+        if (Regex.IsMatch(step, @"(?i)^(set|enter|fill|type|change|update|modify|edit|ensure|make sure|select|choose|assign|upload|attach)\b"))
+            return "needs data entry on the form";
+        return null;
+    }
+
+    private static bool StartsWithNavigation(string step) =>
+        Regex.IsMatch(step, @"(?i)^open (modules menu|module '|administration|'[^']+' (from|inside))");
+
+    /// <summary>The Modules area the ticket text mentions first ("MOC", "Incident", ...). Acronyms match case-sensitively.</summary>
+    private static string? MentionedModulesArea(string text)
+    {
+        string? best = null;
+        var bestIndex = int.MaxValue;
+        foreach (var area in ModulesMenuAreas)
+        {
+            var options = area.Length <= 3 ? RegexOptions.None : RegexOptions.IgnoreCase;
+            var m = Regex.Match(text, $@"(?<![\w-]){Regex.Escape(area)}(?![\w-])", options);
+            if (m.Success && (m.Index < bestIndex || (m.Index == bestIndex && area.Length > best!.Length)))
+            {
+                best = area;
+                bestIndex = m.Index;
+            }
+        }
+        return best;
+    }
+
     public static string DescribeDefect(string? summary, string? description = null)
     {
         var corpus = $"{summary}\n{description}";
@@ -145,7 +217,7 @@ public static class TicketStepPlanner
             return "misleading Save / approval confirmation message";
         }
 
-        var summaryText = (summary ?? "").Trim();
+        var summaryText = StripVersionTags(summary);
         return string.IsNullOrWhiteSpace(summaryText) ? "the defect described in the ticket" : Truncate(summaryText, 140);
     }
 
@@ -229,12 +301,44 @@ public static class TicketStepPlanner
         return steps;
     }
 
+    /// <summary>
+    /// Removes leading release/version tags such as "[12.28.6]", "[v14.2]" or "[Release 12.28]" from a summary.
+    /// They identify the build the bug was found in — never a page, menu or feature to open.
+    /// </summary>
+    public static string StripVersionTags(string? summary)
+    {
+        var s = summary ?? "";
+        while (true)
+        {
+            var m = Regex.Match(s, @"^\s*\[([^\]]*)\]\s*");
+            if (!m.Success || !IsVersionLabel(m.Groups[1].Value))
+                return s.Trim();
+            s = s[m.Length..];
+        }
+    }
+
+    public static bool IsVersionLabel(string label) =>
+        Regex.IsMatch(label.Trim(), @"(?i)^(?:v(?:ersion)?\s*|r(?:elease)?\s*|build\s*)?\d+(?:\.\d+)+(?:[-+][0-9a-z.]+)?$");
+
     public static NavigationEntry ResolveEntryPoint(string summary, string corpus)
     {
+        summary = StripVersionTags(summary);
         if (LooksLikeAdministration(corpus) || LooksLikeAdministration(summary))
         {
             var sub = ExtractAdminSubArea(corpus) ?? ExtractAdminSubArea(summary);
             return new NavigationEntry(NavigationKind.Administration, sub);
+        }
+
+        // "Badgermail- Timed alert ..." / "Badgermail: ..." — the leading name before the dash/colon is the feature area.
+        var leadingArea = Regex.Match(summary, @"^\s*([A-Z][A-Za-z0-9]+(?:\s[A-Z][A-Za-z0-9]+){0,2})\s*[-–:]\s*\S");
+        if (leadingArea.Success && !IsNoiseWord(leadingArea.Groups[1].Value) && !summary.TrimStart().StartsWith("["))
+        {
+            var label = CleanLabel(leadingArea.Groups[1].Value);
+            if (IsAdministrationLabel(label))
+                return new NavigationEntry(NavigationKind.Administration, null);
+            if (IsModulesMenuArea(label))
+                return new NavigationEntry(NavigationKind.Modules, label);
+            return new NavigationEntry(NavigationKind.Direct, label);
         }
 
         var bracket = Regex.Match(summary, @"^\s*\[([^\]]+)\]");

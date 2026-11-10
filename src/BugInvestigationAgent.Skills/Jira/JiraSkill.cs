@@ -315,6 +315,7 @@ public sealed class JiraSkill : ISkill
             JsonValueKind.True => "true",
             JsonValueKind.False => "false",
             JsonValueKind.Array => string.Join(", ", el.EnumerateArray().Select(ExtractText).Where(s => !string.IsNullOrWhiteSpace(s))),
+            JsonValueKind.Object when AdfText.IsAdf(el) => AdfText.ToPlainText(el),
             JsonValueKind.Object when el.TryGetProperty("content", out var content) => ExtractText(content),
             JsonValueKind.Object when el.TryGetProperty("text", out var text) => text.GetString(),
             JsonValueKind.Object when el.TryGetProperty("name", out var name) => name.GetString(),
