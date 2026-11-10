@@ -1,0 +1,60 @@
+@page "/reports"
+@rendermode InteractiveServer
+@using BugInvestigationAgent.Core.Reporting
+@using BugInvestigationAgent.Skills.Evidence
+@inject IWebHostEnvironment Env
+
+<PageTitle>Investigation Reports</PageTitle>
+
+<section class="panel">
+    <h2>Investigation reports</h2>
+    <p class="muted">Structured reports saved by completed investigations (App_Data/evidence). They stay available after the
+        app restarts. Nothing here is uploaded to Jira.</p>
+    <button class="btn secondary" @onclick="Load">Refresh</button>
+</section>
+
+<section class="panel">
+    @if (_reports.Count == 0)
+    {
+        <p class="muted">No saved reports yet. Run an investigation on the Workflow page.</p>
+    }
+    else
+    {
+        <table style="width:100%; border-collapse:collapse;">
+            <thead>
+                <tr style="text-align:left;">
+                    <th>Generated</th><th>Ticket</th><th>Environment</th><th>Reproduction</th><th>Confidence</th><th>Download</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var (folder, r) in _reports)
+                {
+                    <tr style="border-top:1px solid var(--border);">
+                        <td>@r.GeneratedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm")</td>
+                        <td><b>@r.IssueKey</b><div class="muted">@r.Summary</div></td>
+                        <td>@(r.EnvironmentName ?? "—")</td>
+                        <td>@r.ReproductionOutcome</td>
+                        <td title="@r.ConfidenceReason">@r.Confidence</td>
+                        <td>
+                            <a href="@Link(folder, ReportFiles.MarkdownFileName)">report.md</a> ·
+                            <a href="@Link(folder, ReportFiles.JsonFileName)">report.json</a>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+@code {
+    private IReadOnlyList<(string Folder, InvestigationReport Report)> _reports = Array.Empty<(string, InvestigationReport)>();
+
+    // Same root the /evidence endpoint serves from (Program.cs).
+    private string EvidenceRoot => Path.Combine(Env.ContentRootPath, "App_Data", "evidence");
+
+    protected override void OnInitialized() => Load();
+
+    private void Load() => _reports = ReportFiles.List(EvidenceRoot);
+
+    private static string Link(string folder, string file) => $"/evidence/{Uri.EscapeDataString(folder)}/{file}";
+}

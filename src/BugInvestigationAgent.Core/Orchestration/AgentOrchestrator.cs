@@ -518,6 +518,46 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         }
     }
 
+    /// <summary>
+    /// Reproduction ran but did not confirm the bug (NotReproduced / Ambiguous). Code analysis still runs, read-only,
+    /// so the report can carry a root-cause HYPOTHESIS and next steps; the outcome stays recorded as it was and the
+    /// report never presents the analysis as confirmed. No fix is applied or offered for approval on this path.
+    /// </summary>
+    private async Task InvestigateWithoutConfirmedReproductionAsync(
+        IServiceProvider sp, IEngineeringMemoryStore memoryStore, AgentSession session, CancellationToken cancellationToken)
+    {
+        var ctx = session.Context;
+        var env = ctx.SelectedEnvironmentDisplayName ?? "the selected environment";
+        var outcomeText = ctx.ReproductionOutcome == ReproductionOutcome.NotReproduced
+            ? $"Could not reproduce {ctx.JiraTicketKey} on {env} — the reported issue was not observed"
+            : $"Could not confirm reproduction for {ctx.JiraTicketKey} on {env}";
+        ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Reproduction outcome recorded: {ctx.ReproductionOutcome}. Continuing with read-only code analysis (results are hypotheses).");
+
+        var analysed = false;
+        var codeSkill = sp.GetRequiredService<IEnumerable<ISkill>>()
+            .FirstOrDefault(s => string.Equals(s.SkillId, SkillIds.CodeInvestigation, StringComparison.OrdinalIgnoreCase));
+        if (MissingInfoResolver.IsLocalWorkspace(ctx.WorkspacePath) && (codeSkill is null || !codeSkill.CanExecute(ctx, _permissions)))
+            ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Code analysis skipped: not available with the current permissions.");
+        else if (MissingInfoResolver.IsLocalWorkspace(ctx.WorkspacePath))
+        {
+            session.SetState(AgentState.Investigating, "Reproduction not confirmed — analysing the code read-only (hypothesis only).");
+            var tags = string.IsNullOrWhiteSpace(ctx.SystemName) ? new List<string>() : new List<string> { ctx.SystemName! };
+            var lessons = await memoryStore.QueryRelevantAsync(ctx.WorkspacePath, tags, cancellationToken);
+            foreach (var lesson in (lessons ?? []).Take(10))
+                ctx.AppliedMemoryLessonIds.Add(lesson.Id.ToString());
+            await ExecuteSkillAsync(sp, SkillIds.CodeInvestigation, session, cancellationToken);
+            analysed = !ctx.CustomFields.ContainsKey("investigationBlockedNoLlm");
+        }
+
+        await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
+        ctx.FinalStatusMessage = outcomeText + (analysed
+            ? ". Code analysis added a root-cause hypothesis (not verified). Review the report."
+            : MissingInfoResolver.IsLocalWorkspace(ctx.WorkspacePath)
+                ? ". No code analysis result (LLM not configured or its call failed — see the report). Review Evidence."
+                : ". No source workspace is available, so no code analysis was done. Review Evidence.");
+        session.SetState(AgentState.Completed, ctx.FinalStatusMessage);
+    }
+
     private async Task ContinueAfterContextReadyAsync(IServiceProvider sp, AgentSession session, CancellationToken cancellationToken)
     {
         try
@@ -590,11 +630,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                     return;
                 case ReproductionOutcome.NotReproduced:
                 case ReproductionOutcome.Ambiguous:
-                    await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
-                    session.Context.FinalStatusMessage = session.Context.ReproductionOutcome == ReproductionOutcome.NotReproduced
-                        ? $"Could not reproduce {session.Context.JiraTicketKey} on {session.Context.SelectedEnvironmentDisplayName ?? "the selected environment"} — the reported issue was not found. Review Evidence."
-                        : $"Could not confirm reproduction for {session.Context.JiraTicketKey} on {session.Context.SelectedEnvironmentDisplayName ?? "the selected environment"}. Review Evidence for that ticket’s feature path, add clearer Jira steps if needed, then Analyze again.";
-                    session.SetState(AgentState.Completed, session.Context.FinalStatusMessage);
+                    await InvestigateWithoutConfirmedReproductionAsync(sp, memoryStore, session, cancellationToken);
                     return;
                 case ReproductionOutcome.Reproduced:
                     break;
@@ -915,20 +951,22 @@ public interface IAgentRuntimeResolver
 public sealed class AgentRuntimeResolver : IAgentRuntimeResolver
 {
     private readonly IEnumerable<Abstractions.IAgentRuntime> _runtimes;
-    private readonly AgentOptions _options;
+    private readonly Abstractions.ILlmSettingsSource _settings;
 
-    public AgentRuntimeResolver(IEnumerable<Abstractions.IAgentRuntime> runtimes, IOptions<AgentOptions> options)
+    public AgentRuntimeResolver(IEnumerable<Abstractions.IAgentRuntime> runtimes, Abstractions.ILlmSettingsSource settings)
     {
         _runtimes = runtimes;
-        _options = options.Value;
+        _settings = settings;
     }
 
     public IReadOnlyList<string> AvailableProviderIds => _runtimes.Select(r => r.ProviderId).ToList();
 
     public Abstractions.IAgentRuntime GetCurrent()
     {
+        // Read per call: the provider chosen in Settings applies to the next investigation step.
+        var active = _settings.ActiveProviderId;
         var runtime = _runtimes.FirstOrDefault(r =>
-            string.Equals(r.ProviderId, _options.ActiveProviderId, StringComparison.OrdinalIgnoreCase));
+            string.Equals(r.ProviderId, active, StringComparison.OrdinalIgnoreCase));
         return runtime ?? _runtimes.FirstOrDefault()
             ?? throw new InvalidOperationException("No AI runtime providers are registered.");
     }

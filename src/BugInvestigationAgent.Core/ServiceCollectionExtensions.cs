@@ -6,6 +6,7 @@ using BugInvestigationAgent.Core.Rules;
 using BugInvestigationAgent.Core.Security;
 using BugInvestigationAgent.Core.Sessions;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace BugInvestigationAgent.Core;
 
@@ -21,6 +22,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<Credentials.ISessionCredentialStore, Credentials.InMemorySessionCredentialStore>();
         services.AddSingleton<IMissingInfoResolver, MissingInfoResolver>();
         services.AddSingleton<IRulesProvider, DefaultRulesProvider>();
+        services.TryAddSingleton<Abstractions.ILlmSettingsSource, Abstractions.OptionsLlmSettingsSource>();
         services.AddSingleton<IAgentRuntimeResolver, AgentRuntimeResolver>();
         services.AddSingleton<IPermissionGate>(sp =>
         {

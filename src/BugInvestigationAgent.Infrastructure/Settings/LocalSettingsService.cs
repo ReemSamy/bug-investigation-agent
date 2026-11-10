@@ -4,7 +4,7 @@ using Microsoft.Extensions.Options;
 
 namespace BugInvestigationAgent.Infrastructure.Settings;
 
-public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDefaults
+public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDefaults, BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource
 {
     private readonly string _path;
     private readonly IOptions<JiraOptions> _jiraFallback;
@@ -127,6 +127,10 @@ public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDe
 
     public string GetActiveProviderId() =>
         First(Snapshot.ActiveProviderId, _agentFallback.Value.ActiveProviderId) ?? "null";
+
+    // ILlmSettingsSource: the investigation workflow uses exactly what the Settings page saved (appsettings as fallback).
+    string BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource.ActiveProviderId => GetActiveProviderId();
+    LlmProviderOptions BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource.Current => GetEffectiveLlm();
 
     public void Reload()
     {

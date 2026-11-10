@@ -24,6 +24,9 @@ builder.Services.AddBugInvestigationCore();
 builder.Services.AddBugInvestigationProviders();
 builder.Services.AddBugInvestigationSkills();
 builder.Services.AddBugInvestigationInfrastructure(builder.Environment.ContentRootPath, builder.Configuration);
+// Local app: the LLM provider, keys and models come from the Settings page (App_Data/local-settings.json).
+builder.Services.AddSingleton<BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource>(
+    sp => sp.GetRequiredService<BugInvestigationAgent.Infrastructure.Settings.LocalSettingsService>());
 
 var app = builder.Build();
 
@@ -58,9 +61,13 @@ app.MapGet("/evidence/{sessionFolder}/{fileName}", (string sessionFolder, string
         ".png" => "image/png",
         ".jpg" or ".jpeg" => "image/jpeg",
         ".webp" => "image/webp",
+        ".md" => "text/markdown; charset=utf-8",
+        ".json" => "application/json",
         _ => "application/octet-stream"
     };
-    return Results.File(full, contentType);
+    // Reports download with a readable name (e.g. VKMS-5102_report.md); images stay inline.
+    var downloadName = fileName.StartsWith("report.", StringComparison.OrdinalIgnoreCase) ? BugInvestigationAgent.Skills.Evidence.ReportFiles.DownloadName(full) : null;
+    return Results.File(full, contentType, downloadName);
 });
 
 app.MapRazorComponents<App>()

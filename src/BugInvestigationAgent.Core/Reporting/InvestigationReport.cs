@@ -17,6 +17,11 @@ public sealed class InvestigationReport
 {
     public required string IssueKey { get; init; }
     public required Guid InvestigationId { get; init; }
+    public string? Summary { get; init; }
+    /// <summary>High / Medium / Low — how strongly the evidence supports the conclusions (see <see cref="ConfidenceReason"/>).</summary>
+    public string Confidence { get; init; } = "Low";
+    public string? ConfidenceReason { get; init; }
+    public List<string> SimilarIssues { get; init; } = new();
     public string? EnvironmentId { get; init; }
     public string? EnvironmentName { get; init; }
     public string? EnvironmentType { get; init; }
@@ -118,10 +123,37 @@ public static class InvestigationReportBuilder
         if (ctx.ReproductionOutcome is ReproductionOutcome.Blocked or ReproductionOutcome.Error or ReproductionOutcome.EnvironmentUnavailable)
             recommendations.Add("Resolve the blocking problem above and run the agent again.");
 
+        var noLlm = ctx.CustomFields.ContainsKey("investigationBlockedNoLlm");
+        var hasRootCause = !string.IsNullOrWhiteSpace(ctx.RootCause) && !noLlm;
+        if (noLlm)
+            recommendations.Add("No code analysis result: configure an approved LLM provider in Sign in / Account (or fix its settings) and run the agent again. Detail: " + R(ctx.RootCause));
+        if (hasRootCause && !reproducedWithEvidence)
+            recommendations.Add($"Validate the root-cause hypothesis manually — reproduction was not confirmed (outcome: {ctx.ReproductionOutcome}).");
+        if (ctx.CustomFields.TryGetValue("manualStepsRemaining", out var manual) && manual != "0")
+            recommendations.Add($"{manual} ticket step(s) need a person (form data entry, waiting or e-mail checks); complete them manually to confirm the bug.");
+        if (recommendations.Count == 0)
+            recommendations.Add("Review the evidence and decide the next action for this ticket.");
+
+        var (confidence, confidenceReason) = (reproducedWithEvidence, hasRootCause) switch
+        {
+            (true, true) => ("High", "Reproduced with screenshot evidence, and code analysis produced a root-cause hypothesis."),
+            (true, false) => ("Medium", "Reproduced with screenshot evidence; no code analysis result."),
+            (false, true) => ("Medium", $"Root cause is a code-analysis hypothesis; reproduction was not confirmed ({ctx.ReproductionOutcome})."),
+            _ => ("Low", $"Reproduction not confirmed ({ctx.ReproductionOutcome}) and no code analysis result.")
+        };
+
+        var similar = ctx.Investigation.SimilarIssues.Take(5)
+            .Select(i => $"{i.Key} — {R(i.Summary)} (score {i.RelevanceScore:0.00}, {(i.RankedByLlm ? "semantic" : "keyword match only")})")
+            .ToList();
+
         return new InvestigationReport
         {
             IssueKey = ctx.JiraTicketKey ?? "?",
             InvestigationId = ctx.InvestigationId,
+            Summary = R(ctx.Summary),
+            Confidence = confidence,
+            ConfidenceReason = confidenceReason,
+            SimilarIssues = similar,
             EnvironmentId = ctx.SelectedEnvironmentId,
             EnvironmentName = ctx.SelectedEnvironmentDisplayName ?? ctx.EnvironmentName,
             EnvironmentType = ctx.SelectedEnvironmentType?.ToString(),
@@ -152,7 +184,11 @@ public static class InvestigationReportBuilder
         var sb = new StringBuilder();
         sb.AppendLine($"**Investigation of {r.IssueKey}** — reproduction: **{r.ReproductionOutcome}**");
         sb.AppendLine();
+        if (!string.IsNullOrWhiteSpace(r.Summary))
+            sb.AppendLine($"Ticket: {r.Summary}").AppendLine();
         sb.AppendLine($"Environment: {r.EnvironmentName ?? "—"}{(r.EnvironmentType is null ? "" : $" ({r.EnvironmentType})")}{(r.ReadOnlyEnvironment ? " — read-only" : "")} · Sign-in: {r.Authentication}");
+        sb.AppendLine();
+        sb.AppendLine($"Confidence: **{r.Confidence}** — {r.ConfidenceReason}");
         sb.AppendLine();
         AppendList(sb, "Confirmed findings (backed by evidence)", r.ConfirmedFindings, "None.");
         AppendList(sb, "Hypotheses (not verified)", r.Hypotheses, "None.");
@@ -164,6 +200,7 @@ public static class InvestigationReportBuilder
         if (r.SkippedSteps.Count > 0)
             AppendList(sb, "Skipped (Production read-only)", r.SkippedSteps, "");
         AppendList(sb, "Code findings" + (r.Repository is null ? "" : $" ({r.Repository})"), r.CodeFindings, "None.");
+        AppendList(sb, "Similar historical issues (candidates, not confirmed duplicates)", r.SimilarIssues, "None found.");
         AppendList(sb, "Evidence (screenshots, passwords masked)", r.Evidence.Select(e => $"{e.FileName} — {e.Caption}").ToList(), "None.");
         sb.AppendLine($"Investigation ID: {r.InvestigationId:N}");
         sb.AppendLine("</details>");

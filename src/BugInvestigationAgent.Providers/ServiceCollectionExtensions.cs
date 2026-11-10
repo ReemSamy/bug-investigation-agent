@@ -14,13 +14,16 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddBugInvestigationProviders(this IServiceCollection services)
     {
         services.AddHttpClient();
+        // Root-cause analysis on a large prompt can take minutes; the 100 s default would cut it off.
+        services.AddHttpClient(OpenAiCompatibleRuntime.Id, c => c.Timeout = TimeSpan.FromMinutes(5));
+        services.AddHttpClient(AnthropicRuntime.Id, c => c.Timeout = TimeSpan.FromMinutes(5));
 
         services.AddSingleton<IAgentRuntime>(sp =>
         {
             var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient(OpenAiCompatibleRuntime.Id);
             return new OpenAiCompatibleRuntime(
                 http,
-                sp.GetRequiredService<IOptions<LlmProviderOptions>>(),
+                sp.GetRequiredService<ILlmSettingsSource>(),
                 sp.GetRequiredService<ILogger<OpenAiCompatibleRuntime>>());
         });
 
@@ -29,7 +32,7 @@ public static class ServiceCollectionExtensions
             var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient(AnthropicRuntime.Id);
             return new AnthropicRuntime(
                 http,
-                sp.GetRequiredService<IOptions<LlmProviderOptions>>(),
+                sp.GetRequiredService<ILlmSettingsSource>(),
                 sp.GetRequiredService<ILogger<AnthropicRuntime>>());
         });
 

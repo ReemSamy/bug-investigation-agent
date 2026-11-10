@@ -74,7 +74,10 @@
     </div>
     <button class="btn secondary" @onclick="SaveWorkspaceOnly">Save workspace</button>
 
-    <h3 style="margin-top:1.75rem">AI provider (optional)</h3>
+    <h3 style="margin-top:1.75rem">AI provider</h3>
+    <p class="hint">Used for ticket understanding, similar-bug ranking and root-cause analysis. Choose
+        <b>anthropic</b> or <b>openai-compatible</b> (cursor / azure-openai are not implemented). Saved keys are never shown
+        again; leave a key empty to keep the saved one.</p>
     <div class="field">
         <label>Active provider</label>
         <select @bind="_providerId">
@@ -85,12 +88,24 @@
         </select>
     </div>
     <div class="field">
-        <label>OpenAI-compatible API key</label>
-        <input type="password" @bind="_openAiKey" autocomplete="new-password" />
+        <label>Anthropic API key @(_anthropicKeySaved ? "(saved)" : "(not set)")</label>
+        <input type="password" @bind="_anthropicKey" autocomplete="new-password" placeholder="@(_anthropicKeySaved ? "•••••• saved — type to replace" : "Paste API key")" />
     </div>
     <div class="field">
-        <label>Anthropic API key</label>
-        <input type="password" @bind="_anthropicKey" autocomplete="new-password" />
+        <label>Anthropic model</label>
+        <input @bind="_anthropicModel" placeholder="claude-opus-5-5" />
+    </div>
+    <div class="field">
+        <label>OpenAI-compatible API key @(_openAiKeySaved ? "(saved)" : "(not set)")</label>
+        <input type="password" @bind="_openAiKey" autocomplete="new-password" placeholder="@(_openAiKeySaved ? "•••••• saved — type to replace" : "Paste API key")" />
+    </div>
+    <div class="field">
+        <label>OpenAI-compatible base URL</label>
+        <input @bind="_openAiBaseUrl" placeholder="https://api.openai.com/v1" />
+    </div>
+    <div class="field">
+        <label>OpenAI-compatible model</label>
+        <input @bind="_openAiModel" />
     </div>
     <button class="btn secondary" @onclick="SaveAiOnly">Save AI settings</button>
 </section>
@@ -103,6 +118,11 @@
     private string _providerId = "null";
     private string _openAiKey = "";
     private string _anthropicKey = "";
+    private bool _openAiKeySaved;
+    private bool _anthropicKeySaved;
+    private string _anthropicModel = "";
+    private string _openAiModel = "";
+    private string _openAiBaseUrl = "";
     private string _message = "";
     private bool _messageOk;
     private bool _busy;
@@ -119,8 +139,14 @@
         _workspace = LocalSettings.DefaultWorkspacePath ?? "";
         _providerId = LocalSettings.GetActiveProviderId();
         var llm = LocalSettings.GetEffectiveLlm();
-        _openAiKey = llm.OpenAiCompatible.ApiKey;
-        _anthropicKey = llm.Anthropic.ApiKey;
+        // Never send saved API keys back to the browser: only whether one is saved.
+        _openAiKey = "";
+        _anthropicKey = "";
+        _openAiKeySaved = !string.IsNullOrWhiteSpace(llm.OpenAiCompatible.ApiKey);
+        _anthropicKeySaved = !string.IsNullOrWhiteSpace(llm.Anthropic.ApiKey);
+        _anthropicModel = llm.Anthropic.Model;
+        _openAiModel = llm.OpenAiCompatible.Model;
+        _openAiBaseUrl = llm.OpenAiCompatible.BaseUrl;
     }
 
     private void PersistCredentials(bool clearSignedIn)
@@ -188,8 +214,15 @@
             doc.LlmProviders.OpenAiCompatible.ApiKey = _openAiKey.Trim();
         if (!string.IsNullOrWhiteSpace(_anthropicKey))
             doc.LlmProviders.Anthropic.ApiKey = _anthropicKey.Trim();
+        if (!string.IsNullOrWhiteSpace(_anthropicModel))
+            doc.LlmProviders.Anthropic.Model = _anthropicModel.Trim();
+        if (!string.IsNullOrWhiteSpace(_openAiModel))
+            doc.LlmProviders.OpenAiCompatible.Model = _openAiModel.Trim();
+        if (!string.IsNullOrWhiteSpace(_openAiBaseUrl))
+            doc.LlmProviders.OpenAiCompatible.BaseUrl = _openAiBaseUrl.Trim();
         LocalSettings.Save(doc);
+        Load();
         _messageOk = true;
-        _message = "AI settings saved.";
+        _message = $"AI settings saved. Active provider: {_providerId} — used from the next investigation step.";
     }
 }

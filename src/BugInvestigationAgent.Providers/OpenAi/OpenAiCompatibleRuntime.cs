@@ -6,7 +6,6 @@ using System.Text.Json.Serialization;
 using BugInvestigationAgent.Core.Abstractions;
 using BugInvestigationAgent.Core.Configuration;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 namespace BugInvestigationAgent.Providers.OpenAi;
 
@@ -14,15 +13,18 @@ public sealed class OpenAiCompatibleRuntime : IAgentRuntime
 {
     public const string Id = "openai-compatible";
     private readonly HttpClient _http;
-    private readonly OpenAiCompatibleOptions _options;
+    private readonly ILlmSettingsSource _settings;
     private readonly ILogger<OpenAiCompatibleRuntime> _logger;
 
-    public OpenAiCompatibleRuntime(HttpClient http, IOptions<LlmProviderOptions> options, ILogger<OpenAiCompatibleRuntime> logger)
+    public OpenAiCompatibleRuntime(HttpClient http, ILlmSettingsSource settings, ILogger<OpenAiCompatibleRuntime> logger)
     {
         _http = http;
-        _options = options.Value.OpenAiCompatible;
+        _settings = settings;
         _logger = logger;
     }
+
+    // Read per call: Settings page changes apply to the next request.
+    private OpenAiCompatibleOptions Options => _settings.Current.OpenAiCompatible;
 
     public string ProviderId => Id;
 
@@ -55,12 +57,12 @@ public sealed class OpenAiCompatibleRuntime : IAgentRuntime
     private HttpRequestMessage CreateRequest(object payload)
     {
         var json = JsonSerializer.Serialize(payload);
-        var req = new HttpRequestMessage(HttpMethod.Post, Combine(_options.BaseUrl, "chat/completions"))
+        var req = new HttpRequestMessage(HttpMethod.Post, Combine(Options.BaseUrl, "chat/completions"))
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
-        if (!string.IsNullOrWhiteSpace(_options.ApiKey))
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.ApiKey);
+        if (!string.IsNullOrWhiteSpace(Options.ApiKey))
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Options.ApiKey);
         return req;
     }
 
@@ -74,7 +76,7 @@ public sealed class OpenAiCompatibleRuntime : IAgentRuntime
 
         return new
         {
-            model = _options.Model,
+            model = Options.Model,
             messages,
             temperature = request.Temperature,
             max_tokens = request.MaxTokens,

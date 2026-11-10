@@ -475,6 +475,17 @@
                     <div class="evidence-summary">@_session.Context.ReproductionNotes</div>
                 }
 
+                @if (_session.Context.CustomFields.ContainsKey("reportSaved"))
+                {
+                    var folder = Uri.EscapeDataString(_session.Context.InvestigationId.ToString("N"));
+                    <div class="banner" style="margin:0.85rem 0">
+                        <strong>Structured report saved.</strong>
+                        <a href="/evidence/@folder/report.md">Download report.md</a> ·
+                        <a href="/evidence/@folder/report.json">report.json</a> ·
+                        <a href="/reports">All reports</a>
+                    </div>
+                }
+
                 @if (shots.Count == 0)
                 {
                     <p class="muted">No screenshots were captured for this run.</p>

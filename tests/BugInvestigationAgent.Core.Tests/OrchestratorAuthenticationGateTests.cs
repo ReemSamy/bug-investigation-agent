@@ -52,6 +52,8 @@ public class OrchestratorAuthenticationGateTests
         public readonly ConcurrentQueue<AuthenticationStatus> LoginOutcomes = new();
         public readonly List<(string Mode, string? EnvironmentId, string? Username)> LoginAttempts = new();
         public int ReproductionRuns;
+        public int CodeInvestigationRuns;
+        public ReproductionOutcome? OutcomeWhenCodeInvestigationStarted;
         public AuthenticationStatus StatusWhenReproductionStarted;
         public AgentOrchestrator Orchestrator = null!;
 
@@ -107,6 +109,13 @@ public class OrchestratorAuthenticationGateTests
                 Interlocked.Increment(ref ReproductionRuns);
                 StatusWhenReproductionStarted = r.Context.AuthenticationStatus;
                 r.Context.ReproductionOutcome = ReproductionOutcome.NotReproduced;
+                return Task.CompletedTask;
+            }));
+            services.AddScoped<ISkill>(_ => new FakeSkill(SkillIds.CodeInvestigation, r =>
+            {
+                Interlocked.Increment(ref CodeInvestigationRuns);
+                OutcomeWhenCodeInvestigationStarted = r.Context.ReproductionOutcome;
+                r.Context.RootCause = "Hypothesis from fake code analysis";
                 return Task.CompletedTask;
             }));
             services.AddScoped(_ => Vault.Object);
@@ -180,6 +189,25 @@ public class OrchestratorAuthenticationGateTests
         h.Vault.Verify(v => v.SaveProfileAsync(It.IsAny<CredentialProfile>(), It.IsAny<CredentialSecret>(), It.IsAny<CancellationToken>()),
             Times.Never, "credentials are not persisted without explicit opt-in");
         Assert.That(session.Context.StatusLog.Any(l => l.Contains("wrong") || l.Contains("right")), Is.False, "passwords never logged");
+    }
+
+    [Test]
+    public async Task Not_reproduced_still_runs_read_only_code_analysis_and_keeps_the_outcome()
+    {
+        var h = new Harness("Seen on KMSQA");
+        h.LoginOutcomes.Enqueue(AuthenticationStatus.Succeeded);
+        var session = h.Sessions.Create();
+
+        await h.Orchestrator.StartAsync(session.Id, "VKMS-3", null);
+        await WaitUntil(() => session.State == AgentState.AwaitingMissingInfo, "initial missing info");
+        await h.Orchestrator.SubmitMissingInfoAsync(session.Id, Env("KMSQA"), Creds("qa_admin", "pw"), false);
+        await WaitUntil(() => session.State == AgentState.Completed, "completion");
+
+        Assert.That(h.CodeInvestigationRuns, Is.EqualTo(1), "code analysis runs even though the bug was not reproduced");
+        Assert.That(h.OutcomeWhenCodeInvestigationStarted, Is.EqualTo(ReproductionOutcome.NotReproduced));
+        Assert.That(session.Context.ReproductionOutcome, Is.EqualTo(ReproductionOutcome.NotReproduced), "outcome is not upgraded");
+        Assert.That(session.Context.FinalStatusMessage, Does.Contain("Could not reproduce").And.Contain("hypothesis"));
+        Assert.That(session.Context.FixApproved, Is.False, "no fix is offered on this path");
     }
 
     [Test]

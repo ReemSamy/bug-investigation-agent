@@ -5,6 +5,7 @@ using BugInvestigationAgent.Core.Configuration;
 using BugInvestigationAgent.Core.Context;
 using BugInvestigationAgent.Core.Environments;
 using BugInvestigationAgent.Core.Permissions;
+using BugInvestigationAgent.Core.Reporting;
 using BugInvestigationAgent.Core.Security;
 using BugInvestigationAgent.Core.Skills;
 using BugInvestigationAgent.Core.Workflow;
@@ -52,6 +53,8 @@ public sealed class EvidenceReportingSkill : ISkill
         sb.AppendLine("Jira upload: not performed (attachment upload is not implemented; evidence is stored locally).");
 
         ctx.Evidence.Add(EvidenceItem.For(ctx, "report", null, sb.ToString()));
+
+        WriteStructuredReport(ctx, request.Progress);
 
         if (string.IsNullOrWhiteSpace(ctx.FinalStatusMessage) && ctx.ReproductionOutcome == ReproductionOutcome.Reproduced && ctx.RetestPassed)
             ctx.FinalStatusMessage = "LOCAL CHANGES VALIDATED → READY FOR HUMAN REVIEW";
@@ -163,6 +166,24 @@ public sealed class EvidenceReportingSkill : ISkill
     /// Writes evidence-manifest.json next to the screenshots: ties every file to ticket, investigation and environment.
     /// Contains no usernames, passwords or tokens.
     /// </summary>
+    /// <summary>Persists report.json + report.md (redacted, same builder as the hosted Jira report).</summary>
+    private void WriteStructuredReport(RuntimeContext ctx, IProgress<string>? progress)
+    {
+        if (_options is null)
+            return;
+        try
+        {
+            var report = InvestigationReportBuilder.Build(ctx, _redactor, ctx.RepositoryDisplay ?? ctx.WorkspacePath);
+            ReportFiles.Write(EvidenceScreenshots.EvidenceDirectory(_options, ctx), report);
+            ctx.CustomFields["reportSaved"] = "true";
+            progress?.Report($"Structured report saved ({ReportFiles.MarkdownFileName}, {ReportFiles.JsonFileName}) — confidence {report.Confidence}.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            progress?.Report("Could not save the structured report: " + _redactor.Redact(ex.Message));
+        }
+    }
+
     private string? WriteManifest(RuntimeContext ctx)
     {
         if (_options is null)
