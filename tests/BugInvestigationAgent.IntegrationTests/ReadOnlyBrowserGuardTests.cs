@@ -1,3 +1,4 @@
+using BugInvestigationAgent.TestKit;
 using BugInvestigationAgent.Core.Authentication;
 using BugInvestigationAgent.Core.Configuration;
 using BugInvestigationAgent.Core.Context;

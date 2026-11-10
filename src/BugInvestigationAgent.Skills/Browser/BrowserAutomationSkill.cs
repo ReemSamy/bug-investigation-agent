@@ -242,7 +242,7 @@ public sealed class BrowserAutomationSkill : ISkill
                 {
                     await EvidenceScreenshots.CaptureAsync(page, _options, ctx, "02-login-rejected",
                         $"Sign-in to {env.DisplayName} was rejected — login error message (password field masked)",
-                        EvidenceCategories.ErrorMessage, env.Login);
+                        EvidenceCategories.Authentication, env.Login);
                 }
                 catch (PlaywrightException) { /* evidence is best-effort */ }
                 await _sessions.CloseAsync(ctx.InvestigationId);

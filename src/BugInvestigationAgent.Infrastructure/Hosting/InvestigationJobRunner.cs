@@ -521,7 +521,7 @@ public sealed class InvestigationJobRunner
 
     private async Task<int> SyncProgressAsync(InvestigationJob job, AgentSession session, int alreadyLogged, CancellationToken ct)
     {
-        var lines = session.Context.StatusLog.ToList();
+        var lines = session.Context.StatusLog.SafeSnapshot(); // consistent copy while the pipeline keeps logging
         if (lines.Count <= alreadyLogged)
             return alreadyLogged;
         foreach (var line in lines.Skip(alreadyLogged).TakeLast(20))

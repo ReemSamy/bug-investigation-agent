@@ -52,6 +52,11 @@ public sealed class HostingOptions
     public string DataProtectionContainer { get; set; } = "dataprotection";
     /// <summary>Key Vault key id used to wrap the Data Protection key ring in hosted mode.</summary>
     public string? DataProtectionKeyId { get; set; }
+    /// <summary>
+    /// Local runs with separate API and worker processes: a shared folder for the key ring, so the worker can decrypt
+    /// what the API stored. Default: App_Data/keys under each service's content root. (Azure uses Blob + Key Vault.)
+    /// </summary>
+    public string? DataProtectionKeyDirectory { get; set; }
 
     public bool IsPostgres => string.Equals(DatabaseProvider, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
 }
@@ -111,7 +116,9 @@ public static class ServiceCollectionExtensions
         }
         else
         {
-            dataProtection.PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(contentRoot, "App_Data", "keys")));
+            dataProtection.PersistKeysToFileSystem(new DirectoryInfo(string.IsNullOrWhiteSpace(hosting.DataProtectionKeyDirectory)
+                ? Path.Combine(contentRoot, "App_Data", "keys")
+                : hosting.DataProtectionKeyDirectory));
             // Encrypt the key ring at rest with the Windows user's DPAPI key.
             if (OperatingSystem.IsWindows())
                 dataProtection.ProtectKeysWithDpapi();

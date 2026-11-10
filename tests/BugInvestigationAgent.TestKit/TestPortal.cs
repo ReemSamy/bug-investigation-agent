@@ -8,7 +8,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
-namespace BugInvestigationAgent.IntegrationTests;
+namespace BugInvestigationAgent.TestKit;
 
 /// <summary>
 /// A REAL local web application (Kestrel on 127.0.0.1) standing in for the KMS environments: login form, error
@@ -43,11 +43,11 @@ public sealed class TestPortal : IAsyncDisposable
 
     private TestPortal(WebApplication app) => _app = app;
 
-    public static async Task<TestPortal> StartAsync()
+    public static async Task<TestPortal> StartAsync(int port = 0)
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
-        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
         var app = builder.Build();
         var portal = new TestPortal(app);
         portal.Map();
@@ -110,7 +110,7 @@ public sealed class TestPortal : IAsyncDisposable
     private IResult Home(HttpContext http, string env) =>
         Authenticated(http, env) is { } user
             ? Html(Layout(env, user, "<h1>My Assignments</h1>" +
-                $"<a id=\"incident\" href=\"/{env}/incident\">Incident</a>" +
+                $"<a id=\"incident\" href=\"/{env}/incident\">Incidents</a>" +
                 $"<form method=\"post\" action=\"/{env}/save\"><button id=\"save\" type=\"submit\">Save</button></form>" +
                 $"<button id=\"delete\" onclick=\"fetch('/{env}/item/1',{{method:'DELETE'}})\">Delete</button>"))
             : Html(LoginPage(env));
@@ -135,7 +135,18 @@ public sealed class TestPortal : IAsyncDisposable
     private static string Layout(string env, string user, string body) =>
         Page($"<nav id=\"user-menu\">Signed in as {WebUtility.HtmlEncode(user)} ({env})</nav>{body}");
 
-    private static string Page(string body) => $"<!doctype html><html><head><title>KMS test portal</title></head><body>{body}</body></html>";
+    private const string Style =
+        "body{margin:0;font:14px/1.5 'Segoe UI',Roboto,sans-serif;color:#172b4d;background:#f4f5f7}" +
+        "header.top{background:#0b4f8a;color:#fff;padding:12px 24px;font-weight:600;font-size:16px}" +
+        "main{max-width:880px;margin:24px auto;background:#fff;border:1px solid #dfe1e6;border-radius:8px;padding:24px}" +
+        "#user-menu{float:right;font-size:13px;color:#44546f;font-weight:600}" +
+        "input{display:block;margin:6px 0 12px;padding:8px;width:280px;border:1px solid #c1c7d0;border-radius:4px}" +
+        "button{padding:8px 14px;border:0;border-radius:4px;background:#0b4f8a;color:#fff;cursor:pointer;margin-right:8px}" +
+        "a#incident{display:inline-block;margin:8px 0 16px;padding:8px 12px;background:#e9f2ff;border-radius:4px;text-decoration:none}" +
+        "[role=alert]{background:#ffebe6;border:1px solid #de350b;color:#bf2600;padding:10px 14px;border-radius:4px;margin:12px 0;font-weight:600}";
+
+    private static string Page(string body) =>
+        $"<!doctype html><html><head><title>KMS test portal</title><style>{Style}</style></head><body><header class=\"top\">KMS (local test portal)</header><main>{body}</main></body></html>";
 
     private static IResult Html(string html) => Results.Content(html, "text/html");
 

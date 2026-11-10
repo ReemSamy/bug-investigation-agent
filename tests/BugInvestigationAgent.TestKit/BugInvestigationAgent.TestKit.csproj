@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Shared by the integration tests: login portal, simulated Jira, Forge token minting, hosts. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.11" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BugInvestigationAgent.Api\BugInvestigationAgent.Api.csproj" Aliases="api" />
+    <ProjectReference Include="..\..\src\BugInvestigationAgent.Worker\BugInvestigationAgent.Worker.csproj" Aliases="worker" />
+    <ProjectReference Include="..\..\src\BugInvestigationAgent.Infrastructure\BugInvestigationAgent.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

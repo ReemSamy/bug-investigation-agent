@@ -160,6 +160,8 @@ public static class EvidenceCategories
     public const string Workflow = "workflow";
     public const string FailureState = "failure-state";
     public const string ErrorMessage = "error-message";
+    /// <summary>Sign-in related screenshots (e.g. a rejected login). Never evidence of the reported bug.</summary>
+    public const string Authentication = "authentication";
     public const string Note = "note";
 }
 

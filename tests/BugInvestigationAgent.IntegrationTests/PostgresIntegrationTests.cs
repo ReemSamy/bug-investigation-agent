@@ -1,3 +1,4 @@
+using BugInvestigationAgent.TestKit;
 using BugInvestigationAgent.Core.Jobs;
 using BugInvestigationAgent.Core.Security;
 using BugInvestigationAgent.Infrastructure.Jobs;

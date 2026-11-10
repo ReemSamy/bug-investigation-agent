@@ -449,7 +449,7 @@
                 }
                 else
                 {
-                    @foreach (var line in _session.Context.StatusLog.Reverse().Take(80).Reverse())
+                    @foreach (var line in _session.Context.StatusLog.SafeSnapshot().TakeLast(80))
                     {
                         <div>@line</div>
                     }
@@ -462,8 +462,9 @@
             <section class="panel">
                 <h3>Evidence</h3>
                 @{
-                    var summary = _session.Context.Evidence.LastOrDefault(e => e.Kind == "summary");
-                    var shots = _session.Context.Evidence.Where(e => e.Kind == "screenshot" && !string.IsNullOrWhiteSpace(e.Path)).ToList();
+                    var evidence = _session.Context.Evidence.SafeSnapshot(); // the pipeline may add items while rendering
+                    var summary = evidence.LastOrDefault(e => e.Kind == "summary");
+                    var shots = evidence.Where(e => e.Kind == "screenshot" && !string.IsNullOrWhiteSpace(e.Path)).ToList();
                 }
                 @if (summary is not null)
                 {
