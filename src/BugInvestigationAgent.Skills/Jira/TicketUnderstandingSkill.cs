@@ -37,7 +37,7 @@ public sealed class TicketUnderstandingSkill : ISkill
         var runtime = _runtimeResolver.GetCurrent();
         if (!LlmHelpers.IsUsableLlm(runtime))
         {
-            request.Progress?.Report("Skipping LLM ticket understanding — no LLM provider configured.");
+            request.Progress?.Report("Skipping LLM ticket understanding — " + (_runtimeResolver.LlmUnavailableReason ?? "no LLM provider available."));
             ctx.Investigation.Intent = null;
             return SkillResult.Ok("Ticket understanding skipped (no LLM).");
         }

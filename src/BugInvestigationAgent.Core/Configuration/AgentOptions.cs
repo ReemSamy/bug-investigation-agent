@@ -24,6 +24,8 @@ public sealed class AgentOptions
 
     /// <summary>Local Visium KMS markdown documentation for RAG retrieval.</summary>
     public KmsDocsOptions KmsDocs { get; set; } = new();
+
+    public SourceVersioningOptions SourceVersioning { get; set; } = new();
 }
 
 public sealed class HistoricalJiraOptions
@@ -82,8 +84,9 @@ public sealed class AgentPermissionOptions
     public bool ReadJira { get; set; } = true;
     public bool UseBrowser { get; set; } = true;
     public bool ReadWorkspace { get; set; } = true;
-    public bool ModifyCode { get; set; } = true;
-    public bool RunValidation { get; set; } = true;
+    // Off by default; also forced off at runtime by Permissions.ReadOnlyRollout.
+    public bool ModifyCode { get; set; }
+    public bool RunValidation { get; set; }
     public bool ManageCredentials { get; set; } = true;
     public bool ManageMemory { get; set; } = true;
     public bool GitCommit { get; set; }
@@ -91,6 +94,8 @@ public sealed class AgentPermissionOptions
     public bool CreatePullRequest { get; set; }
     public bool TriggerCi { get; set; }
     public bool Deploy { get; set; }
+    /// <summary>Allow creating a new local branch for a still-reproducible bug (never checkout/commit/push).</summary>
+    public bool CreateLocalBranch { get; set; } = true;
 
     public Permissions.AgentPermission ToFlags()
     {
@@ -107,8 +112,31 @@ public sealed class AgentPermissionOptions
         if (CreatePullRequest) flags |= Permissions.AgentPermission.CreatePullRequest;
         if (TriggerCi) flags |= Permissions.AgentPermission.TriggerCi;
         if (Deploy) flags |= Permissions.AgentPermission.Deploy;
+        if (CreateLocalBranch) flags |= Permissions.AgentPermission.CreateLocalBranch;
         return flags;
     }
+}
+
+/// <summary>How the deployed KMS version maps to a source branch, and how investigation branches are named.</summary>
+public sealed class SourceVersioningOptions
+{
+    /// <summary>
+    /// Candidate branch names tried in order; the first that EXISTS in the local clone is used. Placeholders:
+    /// {version} (e.g. 12.28.4), {major}.{minor} (12.28), {major}.{minor}.{patch}.
+    /// </summary>
+    public List<string> BranchPatterns { get; set; } = new()
+    {
+        // kms-suite convention (observed 2026-11): origin/release/Release-12.28.4, origin/release/release-v14.1.0
+        "origin/release/Release-{version}", "origin/release/release-v{version}",
+        "origin/release/Release-{major}.{minor}.{patch}", "origin/release/release-v{major}.{minor}.{patch}",
+        "origin/release/Release-{major}.{minor}.0", "origin/release/release-v{major}.{minor}.0", "origin/release/Release-{major}.{minor}",
+        "release/Release-{version}", "release/release-v{version}",
+        "origin/release/{version}", "origin/release/{major}.{minor}.{patch}", "origin/release/{major}.{minor}",
+        "origin/releases/{version}", "origin/releases/{major}.{minor}",
+        "release/{version}", "release/{major}.{minor}.{patch}", "release/{major}.{minor}"
+    };
+    /// <summary>Name of the local branch created for a still-reproducible bug. {IssueKey} is required.</summary>
+    public string NewBranchTemplate { get; set; } = "bugfix/{IssueKey}";
 }
 
 public sealed class JiraOptions

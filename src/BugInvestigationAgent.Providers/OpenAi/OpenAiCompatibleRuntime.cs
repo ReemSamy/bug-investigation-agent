@@ -30,6 +30,10 @@ public sealed class OpenAiCompatibleRuntime : IAgentRuntime
 
     public async Task<AgentTurnResult> CompleteAsync(AgentTurnRequest request, CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(Options.ApiKey))
+            throw new InvalidOperationException("OpenAI-compatible API key is not configured (Sign in / Account → AI provider).");
+        if (string.IsNullOrWhiteSpace(Options.Model))
+            throw new InvalidOperationException("OpenAI-compatible model is not configured (Sign in / Account → AI provider).");
         var payload = BuildPayload(request, stream: false);
         using var req = CreateRequest(payload);
         using var resp = await _http.SendAsync(req, cancellationToken);

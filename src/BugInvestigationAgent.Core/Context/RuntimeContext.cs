@@ -40,6 +40,32 @@ public sealed class RuntimeContext
     /// <summary>Repository investigated (display only).</summary>
     public string? RepositoryDisplay { get; set; }
 
+    // ── Ticket detail (read from Jira, never written back) ──
+    public string? ExpectedResult { get; set; }
+    public string? ActualResult { get; set; }
+    /// <summary>"relates to VKMS-12 (Done): summary" — Jira issue links.</summary>
+    public IList<string> LinkedIssues { get; set; } = new List<string>();
+    /// <summary>Keys of linked issues whose status is done/closed/resolved.</summary>
+    public IList<string> ResolvedLinkedIssueKeys { get; set; } = new List<string>();
+    /// <summary>"2026-02-24 Reem: status Backlog → In Progress" — relevant field changes from the issue history.</summary>
+    public IList<string> IssueHistory { get; set; } = new List<string>();
+
+    // ── Deployed version and source branch ──
+    /// <summary>KMS version detected on the target environment (e.g. "12.28.4"); null when it could not be identified.</summary>
+    public string? DeployedVersion { get; set; }
+    /// <summary>Where the version came from ("configured probe: …", "page text"), or why it is unknown.</summary>
+    public string? DeployedVersionSource { get; set; }
+    /// <summary>Git ref of the source branch matching the deployed version (e.g. "origin/release/12.28"); code is read only from it.</summary>
+    public string? SourceVersionRef { get; set; }
+    public string? SourceVersionCommit { get; set; }
+    /// <summary>Why no matching source branch was used (when <see cref="SourceVersionRef"/> is null).</summary>
+    public string? SourceVersionNote { get; set; }
+    /// <summary>Commits in the version branch that mention this ticket or a resolved linked issue (fix evidence).</summary>
+    public IList<string> FixCommitsInVersion { get; set; } = new List<string>();
+    /// <summary>Local branch created for a still-reproducible bug (never checked out, committed or pushed).</summary>
+    public string? CreatedBranch { get; set; }
+    public string? BranchNote { get; set; }
+
     /// <summary>Investigation identifier (one per Analyze); evidence is filed under it.</summary>
     public Guid InvestigationId => SessionId;
 

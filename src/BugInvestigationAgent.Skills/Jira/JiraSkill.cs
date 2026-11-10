@@ -90,7 +90,7 @@ public sealed class JiraSkill : ISkill
             request.Progress?.Report($"GET {baseUrl}/rest/api/3/issue/{key}");
 
             string json;
-            using (var resp = await client.GetAsync($"rest/api/3/issue/{key}?expand=renderedFields,names", cancellationToken))
+            using (var resp = await client.GetAsync($"rest/api/3/issue/{key}?expand=renderedFields,names,changelog", cancellationToken))
             {
                 var body = await resp.Content.ReadAsStringAsync(cancellationToken);
                 if (resp.IsSuccessStatusCode)
@@ -120,6 +120,8 @@ public sealed class JiraSkill : ISkill
 
             ParseIssue(request.Context, json);
             CaptureIdAndComponents(request.Context, json);
+            ParseLinksAndHistory(request.Context, json);
+            (request.Context.ExpectedResult, request.Context.ActualResult) = ExtractExpectedActual(request.Context.Description);
             request.Context.JiraDetailsLoaded = true;
             request.Progress?.Report(
                 $"Loaded {key}: envUrl={(request.Context.EnvironmentUrl ?? "pending discovery")}, fixVersion={request.Context.FixVersion ?? "?"}, steps={request.Context.ReproductionSteps.Count}, attachments={request.Context.Attachments.Count}.");
@@ -158,6 +160,69 @@ public sealed class JiraSkill : ISkill
             request.Context.JiraDetailsLoaded = false;
             return SkillResult.Fail($"Failed to fetch Jira issue: {ex.Message}");
         }
+    }
+
+    private static readonly string[] DoneStatuses = ["done", "closed", "resolved", "dev done", "released"];
+    private static readonly string[] HistoryFields = ["status", "resolution", "Fix Version", "fixVersions", "Version", "assignee", "priority", "Link"];
+
+    /// <summary>Related issues (issue links) and the relevant part of the change history. Read-only.</summary>
+    public static void ParseLinksAndHistory(RuntimeContext ctx, string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        if (root.TryGetProperty("fields", out var fields) && fields.TryGetProperty("issuelinks", out var links) && links.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var link in links.EnumerateArray())
+            {
+                var outward = link.TryGetProperty("outwardIssue", out var o);
+                var issue = outward ? o : link.TryGetProperty("inwardIssue", out var i) ? i : default;
+                if (issue.ValueKind != JsonValueKind.Object)
+                    continue;
+                var relation = link.TryGetProperty("type", out var t) ? GetString(t, outward ? "outward" : "inward") : null;
+                var key = GetString(issue, "key");
+                var f = issue.TryGetProperty("fields", out var ff) ? ff : default;
+                var status = f.ValueKind == JsonValueKind.Object && f.TryGetProperty("status", out var st) ? GetString(st, "name") : null;
+                var summary = f.ValueKind == JsonValueKind.Object ? GetString(f, "summary") : null;
+                if (string.IsNullOrWhiteSpace(key))
+                    continue;
+                ctx.LinkedIssues.Add($"{relation ?? "linked to"} {key} ({status ?? "?"}): {summary}");
+                if (DoneStatuses.Contains((status ?? "").ToLowerInvariant()))
+                    ctx.ResolvedLinkedIssueKeys.Add(key!);
+            }
+        }
+
+        if (root.TryGetProperty("changelog", out var changelog) && changelog.TryGetProperty("histories", out var histories) && histories.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var h in histories.EnumerateArray())
+            {
+                var when = GetString(h, "created");
+                var who = h.TryGetProperty("author", out var a) ? GetString(a, "displayName") : null;
+                if (!h.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+                    continue;
+                foreach (var item in items.EnumerateArray())
+                {
+                    var field = GetString(item, "field") ?? "";
+                    if (!HistoryFields.Contains(field, StringComparer.OrdinalIgnoreCase))
+                        continue;
+                    ctx.IssueHistory.Add($"{(when is { Length: >= 10 } ? when[..10] : when)} {who}: {field} {GetString(item, "fromString") ?? "—"} → {GetString(item, "toString") ?? "—"}");
+                }
+            }
+            while (ctx.IssueHistory.Count > 30)
+                ctx.IssueHistory.RemoveAt(0); // keep the most recent changes
+        }
+    }
+
+    /// <summary>"Expected result:" / "Actual result:" sections of the description (text up to the next section).</summary>
+    public static (string? Expected, string? Actual) ExtractExpectedActual(string? description)
+    {
+        if (string.IsNullOrWhiteSpace(description))
+            return (null, null);
+        string? Section(string name)
+        {
+            var m = Regex.Match(description, $@"(?ims)^\s*{name}\s*(?:result|results|behaviou?r)?\s*[:\-]\s*(.+?)(?=^\s*(?:expected|actual|steps|environment|notes|attachments?)\b[^\n]*[:\-]|\z)");
+            return m.Success ? m.Groups[1].Value.Trim() : null;
+        }
+        return (Section("expected"), Section("actual"));
     }
 
     private static string EnsureJson(string body, string baseUrl, int statusCode)

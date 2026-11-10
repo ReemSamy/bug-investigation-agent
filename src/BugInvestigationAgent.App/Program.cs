@@ -27,6 +27,14 @@ builder.Services.AddBugInvestigationInfrastructure(builder.Environment.ContentRo
 // Local app: the LLM provider, keys and models come from the Settings page (App_Data/local-settings.json).
 builder.Services.AddSingleton<BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource>(
     sp => sp.GetRequiredService<BugInvestigationAgent.Infrastructure.Settings.LocalSettingsService>());
+// Local app: every finished investigation becomes a record with a Jira comment draft PENDING REVIEW.
+// Nothing is published to Jira except through an explicit Approve & Publish on the review page.
+builder.Services.AddSingleton<BugInvestigationAgent.Core.Investigations.IInvestigationCompletionSink, BugInvestigationAgent.Core.Investigations.InvestigationRecorder>();
+builder.Services.AddSingleton<BugInvestigationAgent.Core.Investigations.CommentReviewService>();
+builder.Services.AddSingleton(new BugInvestigationAgent.Core.Investigations.LegacyBatchOptions());
+builder.Services.AddSingleton<BugInvestigationAgent.Core.Investigations.LegacyBatchService>();
+builder.Services.AddSingleton<BugInvestigationAgent.App.BatchRunHost>();
+builder.Services.AddSingleton<BugInvestigationAgent.Infrastructure.Settings.IntegrationDiagnostics>();
 
 var app = builder.Build();
 
@@ -68,6 +76,37 @@ app.MapGet("/evidence/{sessionFolder}/{fileName}", (string sessionFolder, string
     // Reports download with a readable name (e.g. VKMS-5102_report.md); images stay inline.
     var downloadName = fileName.StartsWith("report.", StringComparison.OrdinalIgnoreCase) ? BugInvestigationAgent.Skills.Evidence.ReportFiles.DownloadName(full) : null;
     return Results.File(full, contentType, downloadName);
+});
+
+// Full report of an investigation record (stored in the database), and the consolidated batch report.
+app.MapGet("/investigations/{id:guid}/report.{ext}", async (Guid id, string ext,
+    BugInvestigationAgent.Core.Investigations.IInvestigationRecordStore records) =>
+{
+    var r = await records.GetAsync(id);
+    if (r is null)
+        return Results.NotFound();
+    return ext.ToLowerInvariant() switch
+    {
+        "md" => Results.Text(r.ReportMarkdown ?? "", "text/markdown; charset=utf-8"),
+        "json" => Results.Text(r.ReportJson ?? "{}", "application/json"),
+        _ => Results.NotFound()
+    };
+});
+app.MapGet("/batches/{id:guid}/consolidated.{ext}", async (Guid id, string ext,
+    BugInvestigationAgent.Core.Investigations.ILegacyBatchStore batches,
+    BugInvestigationAgent.Core.Investigations.LegacyBatchService service) =>
+{
+    var batch = await batches.GetAsync(id);
+    if (batch is null)
+        return Results.NotFound();
+    var rows = BugInvestigationAgent.Core.Investigations.ConsolidatedReportBuilder.Rows(batch, await service.LatestRecordsAsync(batch));
+    var name = $"consolidated-filter-{batch.FilterId}-{batch.CreatedAt:yyyyMMdd-HHmm}.{ext}";
+    return ext.ToLowerInvariant() switch
+    {
+        "md" => Results.File(System.Text.Encoding.UTF8.GetBytes(BugInvestigationAgent.Core.Investigations.ConsolidatedReportBuilder.ToMarkdown(batch, rows)), "text/markdown; charset=utf-8", name),
+        "json" => Results.File(System.Text.Encoding.UTF8.GetBytes(BugInvestigationAgent.Core.Investigations.ConsolidatedReportBuilder.ToJson(batch, rows)), "application/json", name),
+        _ => Results.NotFound()
+    };
 });
 
 app.MapRazorComponents<App>()

@@ -31,6 +31,8 @@ public sealed class AnthropicRuntime : IAgentRuntime
         var options = _settings.Current.Anthropic; // read per call: Settings page changes apply immediately
         if (string.IsNullOrWhiteSpace(options.ApiKey))
             throw new InvalidOperationException("Anthropic API key is not configured (Sign in / Account → AI provider).");
+        if (string.IsNullOrWhiteSpace(options.Model))
+            throw new InvalidOperationException("Anthropic model is not configured (Sign in / Account → AI provider).");
         var messages = request.Messages.Select(m => new { role = m.Role == "assistant" ? "assistant" : "user", content = m.Content }).ToList();
         // No temperature: current Claude models reject sampling parameters.
         var payload = new

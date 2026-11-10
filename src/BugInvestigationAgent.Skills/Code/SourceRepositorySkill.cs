@@ -66,6 +66,7 @@ public sealed class SourceRepositorySkill : ISkill
         {
             await provider.CheckoutAsync(selection, target, cancellationToken);
             ctx.WorkspacePath = target;
+            ctx.CustomFields[CodeInvestigationSkill.HostedCheckoutField] = "true";
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

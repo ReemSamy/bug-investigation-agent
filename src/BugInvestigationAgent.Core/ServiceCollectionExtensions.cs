@@ -27,7 +27,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IPermissionGate>(sp =>
         {
             var options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<AgentOptions>>().Value;
-            return new PermissionGate(options.Permissions.ToFlags());
+            // Read-only rollout enforced at runtime, independent of configuration (see ReadOnlyRollout).
+            return ReadOnlyRollout.Mask(new PermissionGate(options.Permissions.ToFlags()));
         });
         services.AddSingleton<IAgentOrchestrator, AgentOrchestrator>();
         services.AddSingleton<Jira.IJiraAccessProvider, Jira.ConfiguredJiraAccessProvider>();

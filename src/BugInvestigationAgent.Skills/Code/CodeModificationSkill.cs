@@ -20,6 +20,9 @@ public sealed class CodeModificationSkill : ISkill
     public Task<SkillResult> ExecuteAsync(SkillExecutionRequest request, CancellationToken cancellationToken = default)
     {
         var ctx = request.Context;
+        // Defense in depth: even if called directly, never write to the target repository without the permission.
+        if (request.Permissions is null || !request.Permissions.IsAllowed(AgentPermission.ModifyCode))
+            return Task.FromResult(SkillResult.Fail("Code modification is disabled (read-only investigation)."));
         if (!ctx.FixApproved)
             return Task.FromResult(SkillResult.Fail("Fix has not been approved."));
 

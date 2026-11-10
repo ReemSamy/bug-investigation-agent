@@ -14,6 +14,7 @@ public class LlmSettingsAndReportTests
     {
         public string ActiveProviderId { get; set; } = "null";
         public LlmProviderOptions Current { get; set; } = new();
+        public bool ExternalDataSharingApproved { get; set; } = true;
     }
 
     private sealed class NamedRuntime(string id) : IAgentRuntime

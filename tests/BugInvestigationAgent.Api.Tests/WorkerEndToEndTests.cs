@@ -250,11 +250,24 @@ public class WorkerEndToEndTests
         j.Status == InvestigationJobStatus.AwaitingUserInput && j.AwaitingInputKind == kind && j.LeaseOwner is null && j.ContextSnapshotJson is not null;
 
     /// <summary>Same path as the Forge personal settings page: FIT-verified pending list → one-time ticket → direct POST.</summary>
+    /// <summary>The job's pending input item; it can appear a moment after the job reports the suspended state.</summary>
+    private static async Task<PendingInputItem> PendingItemAsync(CredentialChannelService channel, Guid jobId, string account)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (true)
+        {
+            var pending = await channel.ListPendingAsync(new ForgeInvocation { InstallationId = FitFactory.Installation, PrincipalAccountId = account }, CancellationToken.None);
+            var item = pending.SingleOrDefault(p => p.JobId == jobId);
+            if (item is not null || DateTime.UtcNow > deadline)
+                return item ?? throw new InvalidOperationException($"No pending input item for job {jobId}.");
+            await Task.Delay(50);
+        }
+    }
+
     private async Task SubmitCredentials(Guid jobId, string account, string env, string user, string password)
     {
         var channel = S<CredentialChannelService>();
-        var pending = await channel.ListPendingAsync(new ForgeInvocation { InstallationId = FitFactory.Installation, PrincipalAccountId = account }, CancellationToken.None);
-        var item = pending.Single(p => p.JobId == jobId);
+        var item = await PendingItemAsync(channel, jobId, account);
         var result = await channel.SubmitCredentialsAsync(jobId, item.Ticket,
             new CredentialSubmission { EnvironmentId = env, Username = user, Password = password }, CancellationToken.None);
         Assert.That(result, Is.EqualTo(SubmissionResult.Accepted));
@@ -263,8 +276,7 @@ public class WorkerEndToEndTests
     private async Task SubmitMfa(Guid jobId, string account, string code)
     {
         var channel = S<CredentialChannelService>();
-        var pending = await channel.ListPendingAsync(new ForgeInvocation { InstallationId = FitFactory.Installation, PrincipalAccountId = account }, CancellationToken.None);
-        var item = pending.Single(p => p.JobId == jobId);
+        var item = await PendingItemAsync(channel, jobId, account);
         Assert.That(await channel.SubmitMfaCodeAsync(jobId, item.Ticket, new MfaSubmission { Code = code }, CancellationToken.None), Is.EqualTo(SubmissionResult.Accepted));
     }
 

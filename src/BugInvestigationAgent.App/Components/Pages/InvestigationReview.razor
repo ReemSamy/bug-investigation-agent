@@ -1,0 +1,119 @@
+@page "/investigations/{Id:guid}"
+@rendermode InteractiveServer
+@using BugInvestigationAgent.Core.Investigations
+@using BugInvestigationAgent.Core.Reporting
+@using BugInvestigationAgent.Infrastructure.Settings
+@inject IInvestigationRecordStore Records
+@inject CommentReviewService Review
+@inject LocalSettingsService LocalSettings
+
+<PageTitle>Investigation @(_r?.IssueKey)</PageTitle>
+
+@if (_r is null)
+{
+    <section class="panel"><p class="muted">@(_loaded ? "Investigation not found." : "Loading…")</p></section>
+}
+else
+{
+    <section class="panel">
+        <h2>@_r.IssueKey — investigation</h2>
+        <p class="muted">@_r.IssueSummary</p>
+        <div class="banner">Local only: nothing from this investigation is posted to Jira, and no Jira field is changed.</div>
+        <table style="border-collapse:collapse; margin-top:0.5rem">
+            <tr><td class="muted" style="padding-right:1rem">Investigation status</td><td><b>@_r.ExecutionStatus</b> — @_r.ExecutionDetail</td></tr>
+            <tr><td class="muted">Assessment</td><td><b>@InvestigationAssessor.Label(_r.Assessment)</b> — @_r.AssessmentReason
+                @if (_r.Flags.Count > 0) { <div class="muted">Additional flags: @string.Join(", ", _r.Flags)</div> }</td></tr>
+            <tr><td class="muted">Environment</td><td>@(_r.EnvironmentName ?? "—")</td></tr>
+            <tr><td class="muted">KMS version</td><td>@(_r.KmsVersion ?? "unknown")</td></tr>
+            <tr><td class="muted">Source branch</td><td>@(_r.SourceBranch ?? "—")</td></tr>
+            <tr><td class="muted">Reproduction</td><td>@InvestigationAssessor.Label(_r.ReproductionOutcome)</td></tr>
+            <tr><td class="muted">Local branch</td><td>@(_r.CreatedBranch is null ? (_r.BranchNote ?? "None") : $"{_r.CreatedBranch} (not checked out; nothing committed or pushed)")</td></tr>
+            <tr><td class="muted">Root cause</td><td>@(_r.RootCause is null ? "—" : $"{(_r.RootCauseConfirmed ? "Confirmed" : "Hypothesis")}: {_r.RootCause}")</td></tr>
+            <tr><td class="muted">Recommended fix</td><td>@(_r.ProposedFix ?? "—")@if (!string.IsNullOrWhiteSpace(_r.AffectedFilesCsv)) { <div class="muted">Files: @_r.AffectedFilesCsv</div> }</td></tr>
+            <tr><td class="muted">Confidence</td><td>@_r.Confidence</td></tr>
+            <tr><td class="muted">Recommended action</td><td>@_r.RecommendedAction</td></tr>
+            <tr><td class="muted">Similar issues</td><td>@(_r.SimilarIssueKeys.Count == 0 ? "—" : string.Join(", ", _r.SimilarIssueKeys))</td></tr>
+        </table>
+        @if (_report?.MissingForVerification.Count > 0)
+        {
+            <h4 style="margin-top:0.75rem">What prevented full verification / information needed</h4>
+            <ul>@foreach (var m in _report.MissingForVerification) { <li>@m</li> }</ul>
+        }
+        <p style="margin-top:0.75rem">
+            Full report: <a href="/investigations/@_r.Id/report.md" target="_blank">report.md</a> ·
+            <a href="/investigations/@_r.Id/report.json" target="_blank">report.json</a>
+            @if (!string.IsNullOrWhiteSpace(_jiraBrowse)) { <span> · <a href="@_jiraBrowse" target="_blank">Open @_r.IssueKey in Jira</a></span> }
+        </p>
+    </section>
+
+    <section class="panel">
+        <h3>Suggested Jira comment (local text only — never posted)</h3>
+        @if (_r.DraftStatus == DraftReviewStatus.Rejected)
+        {
+            <div class="banner warn">Rejected by @_r.ReviewedBy on @_r.ReviewedAt?.LocalDateTime. Reason: @(_r.RejectionReason ?? "—").</div>
+            <pre style="white-space:pre-wrap">@_r.CommentDraft</pre>
+        }
+        else
+        {
+            <p class="muted">If a person decides to comment on the ticket, they can copy this text into Jira themselves.</p>
+            <textarea @bind="_draft" rows="14" style="width:100%; font-family:monospace;"></textarea>
+            <div class="btn-row" style="margin-top:0.5rem">
+                <button class="btn secondary" disabled="@_busy" @onclick="SaveAsync">Save text</button>
+                <input @bind="_rejectReason" placeholder="Reason (optional)" style="margin-left:1rem" />
+                <button class="btn danger" disabled="@_busy" @onclick="RejectAsync">Reject</button>
+            </div>
+        }
+        @if (!string.IsNullOrWhiteSpace(_message))
+        {
+            <div class="banner @(_ok ? "" : "warn")" style="margin-top:0.75rem">@_message</div>
+        }
+    </section>
+}
+
+@code {
+    [Parameter] public Guid Id { get; set; }
+
+    private InvestigationRecord? _r;
+    private InvestigationReport? _report;
+    private bool _loaded;
+    private string _draft = "";
+    private string _rejectReason = "";
+    private string _message = "";
+    private bool _ok;
+    private bool _busy;
+    private string? _jiraBrowse;
+
+    private string Reviewer => LocalSettings.SignedInDisplayName ?? LocalSettings.SignedInEmail ?? Environment.UserName;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await LoadAsync();
+        var baseUrl = LocalSettings.GetEffective().BaseUrl;
+        _jiraBrowse = string.IsNullOrWhiteSpace(baseUrl) || _r is null ? null : $"{baseUrl.TrimEnd('/')}/browse/{_r.IssueKey}";
+    }
+
+    private async Task LoadAsync()
+    {
+        _r = await Records.GetAsync(Id);
+        _report = InvestigationReport.FromJson(_r?.ReportJson);
+        _draft = _r?.CommentDraft ?? "";
+        _loaded = true;
+    }
+
+    private async Task Run(Func<Task<(bool Ok, string Message)>> action)
+    {
+        _busy = true;
+        try
+        {
+            (_ok, _message) = await action();
+            await LoadAsync();
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private Task SaveAsync() => Run(() => Review.SaveEditAsync(Id, _draft, Reviewer));
+    private Task RejectAsync() => Run(() => Review.RejectAsync(Id, Reviewer, _rejectReason));
+}

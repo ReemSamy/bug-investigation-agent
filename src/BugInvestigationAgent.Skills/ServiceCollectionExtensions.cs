@@ -41,6 +41,8 @@ public static class ServiceCollectionExtensions
         services.AddScoped<ISkill, BrowserAutomationSkill>();
         services.AddScoped<ISkill, ReproductionSkill>();
         services.AddScoped<ISkill, CodeInvestigationSkill>();
+        services.AddScoped<ISkill, SourceVersionSkill>();
+        services.AddScoped<ISkill, LocalBranchSkill>();
         services.AddScoped<ISkill, CodeModificationSkill>();
         services.AddScoped<ISkill, ValidationSkill>();
         services.AddScoped<ISkill, EvidenceReportingSkill>();

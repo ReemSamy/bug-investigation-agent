@@ -1,3 +1,4 @@
+using BugInvestigationAgent.Core.Investigations;
 using BugInvestigationAgent.Core.Jobs;
 using BugInvestigationAgent.Core.Memory;
 using Microsoft.EntityFrameworkCore;
@@ -17,6 +18,9 @@ public sealed class AgentDbContext : DbContext
     public DbSet<JobSecretEntity> JobSecrets => Set<JobSecretEntity>();
     public DbSet<AuditEntry> AuditEntries => Set<AuditEntry>();
     public DbSet<JiraInstallation> JiraInstallations => Set<JiraInstallation>();
+    public DbSet<InvestigationRecord> InvestigationRecords => Set<InvestigationRecord>();
+    public DbSet<LegacyBatch> LegacyBatches => Set<LegacyBatch>();
+    public DbSet<LegacyBatchItem> LegacyBatchItems => Set<LegacyBatchItem>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -90,6 +94,44 @@ public sealed class AgentDbContext : DbContext
             e.HasKey(x => x.InstallationId);
             e.Property(x => x.InstallationId).HasMaxLength(256);
             e.Property(x => x.CloudId).HasMaxLength(128).IsRequired();
+        });
+
+        modelBuilder.Entity<InvestigationRecord>(e =>
+        {
+            e.ToTable("InvestigationRecords");
+            e.HasKey(x => x.Id);
+            e.Ignore(x => x.Flags);
+            e.Ignore(x => x.SimilarIssueKeys);
+            e.Property(x => x.IssueKey).HasMaxLength(64).IsRequired();
+            e.Property(x => x.EnvironmentId).HasMaxLength(256);
+            e.Property(x => x.Confidence).HasMaxLength(16);
+            e.Property(x => x.ExecutionStatus).HasConversion<int>();
+            e.Property(x => x.Assessment).HasConversion<int>();
+            e.Property(x => x.ReproductionOutcome).HasConversion<int>();
+            e.Property(x => x.DraftStatus).HasConversion<int>();
+            e.Property(x => x.PublishStatus).HasConversion<int>();
+            e.Property(x => x.Version).IsConcurrencyToken();
+            e.HasIndex(x => x.IssueKey);
+            e.HasIndex(x => x.InvestigationId);
+            e.HasIndex(x => x.BatchId);
+        });
+
+        modelBuilder.Entity<LegacyBatch>(e =>
+        {
+            e.ToTable("LegacyBatches");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.FilterId).HasMaxLength(64).IsRequired();
+            e.Property(x => x.EnvironmentId).HasMaxLength(256).IsRequired();
+            e.HasMany(x => x.Items).WithOne().HasForeignKey(x => x.BatchId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<LegacyBatchItem>(e =>
+        {
+            e.ToTable("LegacyBatchItems");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.IssueKey).HasMaxLength(64).IsRequired();
+            e.Property(x => x.Status).HasConversion<int>();
+            e.HasIndex(x => new { x.BatchId, x.IssueKey }).IsUnique(); // a ticket appears once per batch
         });
     }
 }

@@ -1,11 +1,22 @@
+using System.Security.Cryptography;
 using System.Text.Json;
 using BugInvestigationAgent.Core.Configuration;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Options;
 
 namespace BugInvestigationAgent.Infrastructure.Settings;
 
+/// <summary>
+/// Local app settings (App_Data/local-settings.json). Secrets (the Jira API token and LLM API keys) are stored
+/// encrypted with ASP.NET Data Protection (key ring protected by the Windows user's DPAPI key), never in plaintext.
+/// Plaintext values from older versions are encrypted in place on first load. Decrypted values exist only in memory.
+/// </summary>
 public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDefaults, BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource
 {
+    public const string ProtectedPrefix = "dp1:";
+    private const string Purpose = "BugInvestigationAgent.LocalSettings.Secrets.v1";
+    private static readonly JsonSerializerOptions WriteOptions = new() { WriteIndented = true };
+    private readonly IDataProtector _protector;
     private readonly string _path;
     private readonly IOptions<JiraOptions> _jiraFallback;
     private readonly IOptions<AgentOptions> _agentFallback;
@@ -17,8 +28,10 @@ public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDe
         IHostEnvironmentAccessor env,
         IOptions<JiraOptions> jiraFallback,
         IOptions<AgentOptions> agentFallback,
-        IOptions<LlmProviderOptions> llmFallback)
+        IOptions<LlmProviderOptions> llmFallback,
+        IDataProtectionProvider dataProtection)
     {
+        _protector = dataProtection.CreateProtector(Purpose);
         _jiraFallback = jiraFallback;
         _agentFallback = agentFallback;
         _llmFallback = llmFallback;
@@ -65,7 +78,7 @@ public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDe
             _doc.JiraSignedInDisplayName = displayName;
             _doc.JiraSignedInEmail = email;
             _doc.JiraSignedInAtUtc = DateTimeOffset.UtcNow;
-            File.WriteAllText(_path, JsonSerializer.Serialize(_doc, new JsonSerializerOptions { WriteIndented = true }));
+            Persist();
         }
     }
 
@@ -76,7 +89,7 @@ public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDe
             _doc.JiraSignedInDisplayName = null;
             _doc.JiraSignedInEmail = null;
             _doc.JiraSignedInAtUtc = null;
-            File.WriteAllText(_path, JsonSerializer.Serialize(_doc, new JsonSerializerOptions { WriteIndented = true }));
+            Persist();
         }
     }
 
@@ -131,6 +144,10 @@ public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDe
     // ILlmSettingsSource: the investigation workflow uses exactly what the Settings page saved (appsettings as fallback).
     string BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource.ActiveProviderId => GetActiveProviderId();
     LlmProviderOptions BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource.Current => GetEffectiveLlm();
+    bool BugInvestigationAgent.Core.Abstractions.ILlmSettingsSource.ExternalDataSharingApproved => Snapshot.LlmDataSharingApprovedAtUtc is not null;
+
+    /// <summary>Names of secrets that could not be decrypted on load (e.g. the key ring was deleted) and must be re-entered.</summary>
+    public IReadOnlyList<string> UnreadableSecrets { get; private set; } = Array.Empty<string>();
 
     public void Reload()
     {
@@ -142,14 +159,45 @@ public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDe
                 return;
             }
 
+            LocalSettingsDocument stored;
             try
             {
-                _doc = JsonSerializer.Deserialize<LocalSettingsDocument>(File.ReadAllText(_path)) ?? new LocalSettingsDocument();
+                stored = JsonSerializer.Deserialize<LocalSettingsDocument>(File.ReadAllText(_path)) ?? new LocalSettingsDocument();
             }
-            catch
+            catch (JsonException)
             {
-                _doc = new LocalSettingsDocument();
+                stored = new LocalSettingsDocument();
             }
+
+            var unreadable = new List<string>();
+            var hadPlaintext = false;
+            string Open(string? value, string name)
+            {
+                if (string.IsNullOrEmpty(value))
+                    return "";
+                if (!value.StartsWith(ProtectedPrefix, StringComparison.Ordinal))
+                {
+                    hadPlaintext = true; // written by an older version: encrypted below
+                    return value;
+                }
+                try
+                {
+                    return _protector.Unprotect(value[ProtectedPrefix.Length..]);
+                }
+                catch (CryptographicException)
+                {
+                    unreadable.Add(name);
+                    return "";
+                }
+            }
+
+            stored.Jira.ApiToken = Open(stored.Jira.ApiToken, "Jira API token");
+            stored.LlmProviders.Anthropic.ApiKey = Open(stored.LlmProviders.Anthropic.ApiKey, "Anthropic API key");
+            stored.LlmProviders.OpenAiCompatible.ApiKey = Open(stored.LlmProviders.OpenAiCompatible.ApiKey, "OpenAI-compatible API key");
+            _doc = stored;
+            UnreadableSecrets = unreadable;
+            if (hadPlaintext)
+                Persist(); // one-time migration: plaintext secrets are re-written encrypted
         }
     }
 
@@ -158,9 +206,24 @@ public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDe
         lock (_gate)
         {
             _doc = Clone(document);
-            File.WriteAllText(_path, JsonSerializer.Serialize(_doc, new JsonSerializerOptions { WriteIndented = true }));
+            Persist();
         }
     }
+
+    /// <summary>Writes the document with every secret encrypted and replaces the file atomically. Caller holds the lock.</summary>
+    private void Persist()
+    {
+        var onDisk = Clone(_doc);
+        onDisk.Jira.ApiToken = Seal(onDisk.Jira.ApiToken);
+        onDisk.LlmProviders.Anthropic.ApiKey = Seal(onDisk.LlmProviders.Anthropic.ApiKey);
+        onDisk.LlmProviders.OpenAiCompatible.ApiKey = Seal(onDisk.LlmProviders.OpenAiCompatible.ApiKey);
+        var temp = _path + ".tmp";
+        File.WriteAllText(temp, JsonSerializer.Serialize(onDisk, WriteOptions));
+        File.Move(temp, _path, overwrite: true);
+    }
+
+    private string Seal(string? secret) =>
+        string.IsNullOrEmpty(secret) ? "" : ProtectedPrefix + _protector.Protect(secret);
 
     private static string First(string? preferred, string? fallback) =>
         !string.IsNullOrWhiteSpace(preferred) ? preferred! : (fallback ?? "");
@@ -172,6 +235,8 @@ public sealed class LocalSettingsService : IJiraConnectionSettings, IWorkspaceDe
         JiraSignedInDisplayName = d.JiraSignedInDisplayName,
         JiraSignedInEmail = d.JiraSignedInEmail,
         JiraSignedInAtUtc = d.JiraSignedInAtUtc,
+        LlmDataSharingApprovedBy = d.LlmDataSharingApprovedBy,
+        LlmDataSharingApprovedAtUtc = d.LlmDataSharingApprovedAtUtc,
         Jira = new JiraOptions
         {
             BaseUrl = d.Jira.BaseUrl,
@@ -204,6 +269,9 @@ public sealed class LocalSettingsDocument
     public string? JiraSignedInDisplayName { get; set; }
     public string? JiraSignedInEmail { get; set; }
     public DateTimeOffset? JiraSignedInAtUtc { get; set; }
+    /// <summary>Who recorded that the company approved sending Jira content and source code to the configured LLM provider.</summary>
+    public string? LlmDataSharingApprovedBy { get; set; }
+    public DateTimeOffset? LlmDataSharingApprovedAtUtc { get; set; }
     public JiraOptions Jira { get; set; } = new();
     public LlmProviderOptions LlmProviders { get; set; } = new();
 }

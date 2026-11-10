@@ -30,6 +30,9 @@ public sealed class ValidationSkill : ISkill
     public async Task<SkillResult> ExecuteAsync(SkillExecutionRequest request, CancellationToken cancellationToken = default)
     {
         var ctx = request.Context;
+        // Defense in depth: build/test commands write into the target repository (bin/obj), so never without the permission.
+        if (request.Permissions is null || !request.Permissions.IsAllowed(AgentPermission.RunValidation))
+            return SkillResult.Fail("Validation commands are disabled (read-only investigation).");
         var workspace = ctx.WorkspacePath!;
         ctx.ValidationResults.Clear();
 

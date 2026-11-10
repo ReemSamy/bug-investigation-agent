@@ -168,6 +168,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IInvestigationJobStore, EfInvestigationJobStore>();
         services.AddSingleton<IJobSecretStore, DataProtectionJobSecretStore>();
         services.AddSingleton<IAuditLog, EfAuditLog>();
+        // Investigation records, legacy batches and the Jira gateway (reads; one comment write on explicit approval).
+        services.AddSingleton<BugInvestigationAgent.Core.Investigations.IInvestigationRecordStore, Investigations.EfInvestigationRecordStore>();
+        services.AddSingleton<BugInvestigationAgent.Core.Investigations.ILegacyBatchStore, Investigations.EfLegacyBatchStore>();
+        services.AddSingleton<BugInvestigationAgent.Core.Investigations.IJiraIssueGateway, Investigations.JiraIssueGateway>();
         services.AddSingleton<Hosting.JobInputService>();
         if (!string.IsNullOrWhiteSpace(hosting.ServiceBusNamespace))
         {
@@ -205,6 +209,7 @@ public static class ServiceCollectionExtensions
 
         // ── Azure DevOps (read-only) ──
         services.AddSingleton<IProcessRunner, ProcessRunner>();
+        services.AddSingleton<BugInvestigationAgent.Core.Repositories.ISourceVersionControl, GitSourceVersionControl>();
         services.AddSingleton<ISourceRepositoryProvider, AzureDevOpsRepositoryProvider>();
 
         services.AddScoped<IEngineeringMemoryStore, EfEngineeringMemoryStore>();

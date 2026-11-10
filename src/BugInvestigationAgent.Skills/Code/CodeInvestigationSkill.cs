@@ -18,13 +18,19 @@ public sealed class CodeInvestigationSkill : ISkill
     private readonly IRulesProvider _rulesProvider;
     private readonly IEngineeringMemoryStore _memoryStore;
     private readonly ISecretRedactor _redactor;
+    private readonly BugInvestigationAgent.Core.Repositories.ISourceVersionControl _git;
+
+    public const string HostedCheckoutField = "sourceCheckout";
+    public const string SkippedField = "codeAnalysisSkipped";
 
     public CodeInvestigationSkill(
         IAgentRuntimeResolver runtimeResolver,
         IRulesProvider rulesProvider,
         IEngineeringMemoryStore memoryStore,
-        ISecretRedactor redactor)
+        ISecretRedactor redactor,
+        BugInvestigationAgent.Core.Repositories.ISourceVersionControl git)
     {
+        _git = git;
         _runtimeResolver = runtimeResolver;
         _rulesProvider = rulesProvider;
         _memoryStore = memoryStore;
@@ -42,14 +48,29 @@ public sealed class CodeInvestigationSkill : ISkill
     {
         var ctx = request.Context;
         var workspace = ctx.WorkspacePath!;
-        request.Progress?.Report($"Scanning workspace and project rules under {workspace}.");
+
+        // Code is analysed ONLY from the branch matching the deployed KMS version (read via git, never checked out),
+        // or from the hosted worker's fresh checkout of the mapped branch. The local working folder is never scanned:
+        // it may be on any branch.
+        var fromVersionBranch = !string.IsNullOrWhiteSpace(ctx.SourceVersionRef);
+        if (!fromVersionBranch && !ctx.CustomFields.ContainsKey(HostedCheckoutField))
+        {
+            ctx.CustomFields[SkippedField] = ctx.SourceVersionNote ?? "No source branch matching the deployed version.";
+            request.Progress?.Report("Code analysis skipped — " + ctx.CustomFields[SkippedField]);
+            return SkillResult.Ok("Code analysis skipped: no matching version branch.");
+        }
+        request.Progress?.Report(fromVersionBranch
+            ? $"Reading code from {ctx.SourceVersionRef} (git, no checkout)."
+            : $"Scanning the repository checkout under {workspace}.");
 
         var safety = await _rulesProvider.GetAppSafetyRulesAsync(cancellationToken);
         var workspaceRules = await _rulesProvider.LoadWorkspaceRulesAsync(workspace, cancellationToken);
         var lessons = await _memoryStore.QueryRelevantAsync(workspace, new[] { ctx.SystemName ?? "", "bug", "routing" }, cancellationToken);
 
         var keywords = ExtractKeywords(ctx);
-        var snippets = SearchWorkspace(workspace, keywords, maxFiles: 12);
+        var snippets = fromVersionBranch
+            ? await _git.GrepAsync(workspace, ctx.SourceVersionRef!, keywords, maxFiles: 12, cancellationToken)
+            : SearchWorkspace(workspace, keywords, maxFiles: 12);
         var browserObs = BuildBrowserObservations(ctx);
         ctx.Investigation.BrowserObservationsSummary = browserObs;
 
@@ -111,14 +132,13 @@ public sealed class CodeInvestigationSkill : ISkill
             string.Equals(runtime.ProviderId, "azure-openai", StringComparison.OrdinalIgnoreCase))
         {
             ctx.RootCause =
-                "Investigation paused: no real LLM provider is configured (active provider is a stub/null). " +
-                "The bug may have been reproduced in the browser, but a code fix cannot be invented without an API key. " +
-                "Open Sign in / Account, set OpenAI-compatible or Anthropic API key, set Active provider, then Analyze again.";
+                "No code analysis: " + (_runtimeResolver.LlmUnavailableReason ?? "no real LLM provider is configured.") +
+                " Nothing was sent to an external service; no root cause was guessed.";
             ctx.ProposedFixSummary = "Configure an LLM API key before requesting a code fix.";
             ctx.ProposedFiles = new List<string>();
             ctx.ProposedDiff = "";
             ctx.CustomFields["investigationBlockedNoLlm"] = "true";
-            request.Progress?.Report("Skipped code fix proposal — no LLM API key configured.");
+            request.Progress?.Report("Skipped code analysis — " + (_runtimeResolver.LlmUnavailableReason ?? "no LLM provider available."));
             return SkillResult.Ok("Investigation blocked: LLM not configured.");
         }
 

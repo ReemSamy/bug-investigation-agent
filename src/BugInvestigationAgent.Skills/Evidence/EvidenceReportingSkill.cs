@@ -174,8 +174,10 @@ public sealed class EvidenceReportingSkill : ISkill
         try
         {
             var report = InvestigationReportBuilder.Build(ctx, _redactor, ctx.RepositoryDisplay ?? ctx.WorkspacePath);
-            ReportFiles.Write(EvidenceScreenshots.EvidenceDirectory(_options, ctx), report);
+            var dir = EvidenceScreenshots.EvidenceDirectory(_options, ctx);
+            ReportFiles.Write(dir, report);
             ctx.CustomFields["reportSaved"] = "true";
+            ctx.CustomFields[BugInvestigationAgent.Core.Investigations.InvestigationRecorder.ReportDirectoryField] = dir;
             progress?.Report($"Structured report saved ({ReportFiles.MarkdownFileName}, {ReportFiles.JsonFileName}) — confidence {report.Confidence}.");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

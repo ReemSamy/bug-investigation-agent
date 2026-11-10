@@ -1,0 +1,201 @@
+@page "/batches"
+@rendermode InteractiveServer
+@implements IDisposable
+@using BugInvestigationAgent.Core.Credentials
+@using BugInvestigationAgent.Core.Environments
+@using BugInvestigationAgent.Core.Investigations
+@using BugInvestigationAgent.Infrastructure.Settings
+@inject LegacyBatchService Service
+@inject ILegacyBatchStore BatchStore
+@inject BatchRunHost RunHost
+@inject IEnvironmentSelectionService EnvironmentSelection
+@inject ICredentialVault Vault
+@inject LocalSettingsService LocalSettings
+
+<PageTitle>Legacy batches</PageTitle>
+
+<section class="panel">
+    <h2>Legacy bug batches</h2>
+    <p class="muted">A batch freezes a Jira filter's issues and investigates them one by one. It only <b>reads</b> Jira — nothing is
+        posted and no field changes. The only write is a new local branch (from the deployed version's branch) for a bug that is
+        reproduced with evidence. Runs start only when you click Run; a ticket already investigated is skipped unless you tick re-run.</p>
+
+    <h3>New snapshot</h3>
+    <div class="field"><label>Jira filter id</label><input @bind="_filterId" /></div>
+    <div class="field">
+        <label>Environment (non-production only)</label>
+        <select @bind="_environmentId" @bind:after="LoadProfilesAsync">
+            <option value="">— choose —</option>
+            @foreach (var env in _environments)
+            {
+                <option value="@env.Id" disabled="@env.IsProduction">@env.DisplayName (@env.Type)@(env.IsProduction ? " — not allowed" : "")</option>
+            }
+            <option value="@EnvironmentSelectionService.AdHocOptionId">Other (enter URL)</option>
+        </select>
+    </div>
+    @if (_environmentId == EnvironmentSelectionService.AdHocOptionId)
+    {
+        <div class="field"><label>Environment URL</label><input @bind="_environmentUrl" @bind:after="LoadProfilesAsync" placeholder="https://…" /></div>
+    }
+    <div class="field">
+        <label>Saved credentials for this environment (encrypted profile; no password is typed here)</label>
+        <select @bind="_profileId">
+            <option value="">— none (tickets will be Blocked at sign-in) —</option>
+            @foreach (var p in _profiles)
+            {
+                <option value="@p.Id">@p.Label</option>
+            }
+        </select>
+    </div>
+    <button class="btn secondary" disabled="@_busy" @onclick="CreateAsync">Create snapshot (reads Jira only)</button>
+</section>
+
+@if (!string.IsNullOrWhiteSpace(_message))
+{
+    <div class="banner @(_ok ? "" : "warn")">@_message</div>
+}
+
+@foreach (var b in _batches)
+{
+    var d = _dashboards.GetValueOrDefault(b.Id);
+    var running = RunHost.IsRunning(b.Id);
+    <section class="panel">
+        <h3>@b.Name</h3>
+        <div class="muted">Environment: @(b.EnvironmentName ?? b.EnvironmentId) · created by @(b.CreatedBy ?? "—") · @b.CreatedAt.LocalDateTime</div>
+        <div class="muted">Membership: @(b.LastMembershipChange ?? "not checked yet")</div>
+        @if (d is not null)
+        {
+            <p style="margin-top:0.5rem">
+                Total <b>@d.Total</b> · Pending @d.Pending · Running @d.Running · Completed @d.Completed · Inconclusive @d.Inconclusive ·
+                Blocked @d.Blocked · Failed @d.Failed · Still reproducible <b>@d.StillReproducible</b> · Confirmed fixed @d.ConfirmedFixed · Local branches created <b>@d.BranchesCreated</b>
+            </p>
+        }
+        <div class="btn-row">
+            <label>Run next <input type="number" min="1" style="width:5rem" @bind="_runCount" /> ticket(s)</label>
+            <label><input type="checkbox" @bind="_rerun" /> Re-run tickets already investigated</label>
+            <button class="btn" disabled="@(running || _busy)" @onclick="() => Start(b.Id, false)">Run / Resume</button>
+            <button class="btn secondary" disabled="@(running || _busy)" @onclick="() => Start(b.Id, true)">Retry failed &amp; blocked</button>
+            <button class="btn secondary" disabled="@(!running)" @onclick="() => RunHost.Stop(b.Id)">Stop after current ticket</button>
+            <button class="btn secondary" disabled="@_busy" @onclick="() => CheckAsync(b.Id)">Check filter membership</button>
+            <a class="btn secondary" href="/batches/@b.Id/consolidated.md">Consolidated report (.md)</a>
+            <a class="btn secondary" href="/batches/@b.Id/consolidated.json">(.json)</a>
+        </div>
+        @if (running) { <p class="muted">Running…</p> }
+
+        <details style="margin-top:0.75rem">
+            <summary>Tickets (@b.Items.Count)</summary>
+            <table style="width:100%; border-collapse:collapse;">
+                <tr style="text-align:left;"><th>#</th><th>Ticket</th><th>Status</th><th>Attempts</th><th>Note</th><th></th></tr>
+                @foreach (var i in b.Items)
+                {
+                    <tr style="border-top:1px solid var(--border);">
+                        <td>@(i.Position + 1)</td><td>@i.IssueKey</td><td>@i.Status</td><td>@i.Attempts</td>
+                        <td class="muted">@i.LastError</td>
+                        <td>@if (i.RecordId is Guid rid) { <a href="/investigations/@rid">Review</a> }</td>
+                    </tr>
+                }
+            </table>
+        </details>
+    </section>
+}
+
+@code {
+    private string _filterId = "11265";
+    private string _environmentId = "";
+    private string _environmentUrl = "";
+    private string _profileId = "";
+    private int _runCount = 1;
+    private bool _rerun;
+    private IReadOnlyList<AppEnvironment> _environments = Array.Empty<AppEnvironment>();
+    private IReadOnlyList<CredentialProfile> _profiles = Array.Empty<CredentialProfile>();
+    private IReadOnlyList<LegacyBatch> _batches = Array.Empty<LegacyBatch>();
+    private readonly Dictionary<Guid, BatchDashboard> _dashboards = new();
+    private string _message = "";
+    private bool _ok;
+    private bool _busy;
+    private Timer? _timer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _environments = EnvironmentSelection.ListForApplication(null);
+        await LoadAsync();
+        _timer = new Timer(_ => InvokeAsync(async () =>
+        {
+            if (_batches.Any(b => RunHost.IsRunning(b.Id)))
+            {
+                await LoadAsync();
+                StateHasChanged();
+            }
+        }), null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+    }
+
+    private async Task LoadAsync()
+    {
+        _batches = await BatchStore.ListAsync();
+        foreach (var b in _batches)
+            _dashboards[b.Id] = await Service.GetDashboardAsync(b.Id);
+        if (!string.IsNullOrWhiteSpace(RunHost.LastError))
+            (_ok, _message) = (false, "Last batch run stopped: " + RunHost.LastError);
+    }
+
+    private async Task LoadProfilesAsync()
+    {
+        _profileId = "";
+        var check = EnvironmentSelection.Validate(_environmentId, _environmentUrl);
+        var envId = check.Environment?.Id;
+        _profiles = envId is null
+            ? Array.Empty<CredentialProfile>()
+            : (await Vault.ListProfilesAsync()).Where(p => string.Equals(p.EnvironmentId, envId, StringComparison.OrdinalIgnoreCase)).ToList();
+    }
+
+    private async Task CreateAsync()
+    {
+        _busy = true;
+        try
+        {
+            var batch = await Service.CreateSnapshotAsync(_filterId.Trim(), _environmentId,
+                string.IsNullOrWhiteSpace(_environmentUrl) ? null : _environmentUrl.Trim(),
+                Guid.TryParse(_profileId, out var p) ? p : null,
+                LocalSettings.SignedInDisplayName ?? LocalSettings.SignedInEmail);
+            (_ok, _message) = (true, $"Snapshot created with {batch.Items.Count} issue(s). Nothing was investigated yet.");
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            (_ok, _message) = (false, ex.Message);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void Start(Guid batchId, bool retry)
+    {
+        var count = Math.Max(1, _runCount);
+        (_ok, _message) = RunHost.Start(batchId, retry, count, _rerun)
+            ? (true, $"Started: up to {count} ticket(s). Nothing is posted to Jira.")
+            : (false, "This batch is already running.");
+    }
+
+    private async Task CheckAsync(Guid batchId)
+    {
+        _busy = true;
+        try
+        {
+            var (added, removed) = await Service.CheckMembershipAsync(batchId);
+            (_ok, _message) = (true, $"Membership check: {added.Count} added, {removed.Count} removed since the snapshot (the snapshot is unchanged).");
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            (_ok, _message) = (false, ex.Message);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    public void Dispose() => _timer?.Dispose();
+}

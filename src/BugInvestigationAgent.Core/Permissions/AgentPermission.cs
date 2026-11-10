@@ -17,6 +17,8 @@ public enum AgentPermission
     CreatePullRequest = 1 << 12,
     TriggerCi = 1 << 13,
     Deploy = 1 << 14,
+    /// <summary>Create ONE new local branch (no checkout, commit, push or file change) for a still-reproducible bug.</summary>
+    CreateLocalBranch = 1 << 15,
 }
 
 public interface IPermissionGate

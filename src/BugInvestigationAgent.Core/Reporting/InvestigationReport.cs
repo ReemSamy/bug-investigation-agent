@@ -40,6 +40,26 @@ public sealed class InvestigationReport
     public string? Repository { get; init; }
     public DateTimeOffset GeneratedAt { get; init; } = DateTimeOffset.UtcNow;
 
+    // Ticket detail
+    public string? ExpectedResult { get; init; }
+    public string? ActualResult { get; init; }
+    public List<string> LinkedIssues { get; init; } = new();
+    public List<string> IssueHistory { get; init; } = new();
+    // Version and branches
+    public string? KmsVersion { get; init; }
+    public string? KmsVersionSource { get; init; }
+    public string? SourceBranch { get; init; }
+    public string? SourceCommit { get; init; }
+    public List<string> FixCommitsInVersion { get; init; } = new();
+    public string? CreatedBranch { get; init; }
+    public string? BranchNote { get; init; }
+    // Recommended fix (text only — never applied)
+    public string? ProposedFix { get; init; }
+    public List<string> AffectedFiles { get; init; } = new();
+    public string? SuggestedCodeChange { get; init; }
+    /// <summary>What prevented full verification and what information is needed.</summary>
+    public List<string> MissingForVerification { get; init; } = new();
+
     public string ToJson() => JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = false });
     public static InvestigationReport? FromJson(string? json) =>
         string.IsNullOrWhiteSpace(json) ? null : JsonSerializer.Deserialize<InvestigationReport>(json);
@@ -91,7 +111,7 @@ public static class InvestigationReportBuilder
         foreach (var err in pageErrors.Take(3))
             confirmed.Add($"Browser reported a page error: {err}");
 
-        if (!string.IsNullOrWhiteSpace(ctx.RootCause) && !ctx.CustomFields.ContainsKey("investigationBlockedNoLlm"))
+        if (!string.IsNullOrWhiteSpace(ctx.RootCause) && !(ctx.CustomFields.ContainsKey("investigationBlockedNoLlm") || ctx.CustomFields.ContainsKey("codeAnalysisSkipped")))
         {
             // Root cause from code analysis is a hypothesis unless a fix was applied AND the retest no longer shows the bug.
             if (ctx.FixApproved && ctx.RetestPassed)
@@ -124,7 +144,37 @@ public static class InvestigationReportBuilder
             recommendations.Add("Resolve the blocking problem above and run the agent again.");
 
         var noLlm = ctx.CustomFields.ContainsKey("investigationBlockedNoLlm");
-        var hasRootCause = !string.IsNullOrWhiteSpace(ctx.RootCause) && !noLlm;
+        var hasRootCause = !string.IsNullOrWhiteSpace(ctx.RootCause) && !(ctx.CustomFields.ContainsKey("investigationBlockedNoLlm") || ctx.CustomFields.ContainsKey("codeAnalysisSkipped"));
+        if (ctx.CustomFields.TryGetValue("codeAnalysisSkipped", out var skipped))
+            recommendations.Add("Code was not analysed: " + R(skipped));
+        if (ctx.FixCommitsInVersion.Count > 0)
+            confirmed.Add($"{ctx.FixCommitsInVersion.Count} commit(s) in {ctx.SourceVersionRef} (deployed KMS {ctx.DeployedVersion}) mention this ticket or a resolved linked issue: " +
+                          string.Join("; ", ctx.FixCommitsInVersion.Take(3).Select(R)));
+        if (!string.IsNullOrWhiteSpace(ctx.CreatedBranch))
+            recommendations.Add($"Local branch {ctx.CreatedBranch} was created from {ctx.SourceVersionRef} for the fix (not checked out; nothing committed or pushed).");
+
+        var missing = new List<string>();
+        if (ctx.ReproductionOutcome is not ReproductionOutcome.Reproduced and not ReproductionOutcome.NotReproduced)
+        {
+            if (ctx.CustomFields.TryGetValue("manualStepsRemaining", out var manualCount) && manualCount != "0")
+                missing.Add($"{manualCount} ticket step(s) need a person (form data entry, waiting or e-mail checks).");
+            if (ctx.ReproductionSteps.Count == 0)
+                missing.Add("The ticket has no reproduction steps.");
+            if (!string.IsNullOrWhiteSpace(ctx.ReproductionNotes))
+                missing.Add("Reproduction note: " + R(ctx.ReproductionNotes));
+            missing.Add(ctx.ReproductionOutcome switch
+            {
+                ReproductionOutcome.Ambiguous => "The reproduction neither showed nor ruled out the defect: precise steps and the expected result shown in the UI are needed to verify it.",
+                ReproductionOutcome.NotStarted => "Reproduction was not attempted.",
+                _ => $"Reproduction could not run ({ctx.ReproductionOutcome}); resolve the problem above and investigate again."
+            });
+        }
+        if (string.IsNullOrWhiteSpace(ctx.DeployedVersion))
+            missing.Add("The deployed KMS version could not be identified" + (ctx.DeployedVersionSource is null ? "." : $" ({R(ctx.DeployedVersionSource)})."));
+        if (string.IsNullOrWhiteSpace(ctx.SourceVersionRef) && !string.IsNullOrWhiteSpace(ctx.SourceVersionNote))
+            missing.Add(R(ctx.SourceVersionNote));
+        if (string.IsNullOrWhiteSpace(ctx.ExpectedResult))
+            missing.Add("The ticket does not state the expected result.");
         if (noLlm)
             recommendations.Add("No code analysis result: configure an approved LLM provider in Sign in / Account (or fix its settings) and run the agent again. Detail: " + R(ctx.RootCause));
         if (hasRootCause && !reproducedWithEvidence)
@@ -174,7 +224,22 @@ public static class InvestigationReportBuilder
                 Caption = R(s.Caption),
                 Category = s.Category
             }).ToList(),
-            Repository = repository
+            Repository = repository,
+            ExpectedResult = R(ctx.ExpectedResult),
+            ActualResult = R(ctx.ActualResult),
+            LinkedIssues = ctx.LinkedIssues.Select(R).ToList(),
+            IssueHistory = ctx.IssueHistory.TakeLast(10).Select(R).ToList(),
+            KmsVersion = ctx.DeployedVersion,
+            KmsVersionSource = R(ctx.DeployedVersionSource),
+            SourceBranch = ctx.SourceVersionRef,
+            SourceCommit = ctx.SourceVersionCommit,
+            FixCommitsInVersion = ctx.FixCommitsInVersion.Select(R).ToList(),
+            CreatedBranch = ctx.CreatedBranch,
+            BranchNote = R(ctx.BranchNote),
+            ProposedFix = hasRootCause ? R(ctx.ProposedFixSummary) : null,
+            AffectedFiles = hasRootCause ? ctx.ProposedFiles.Take(15).ToList() : new List<string>(),
+            SuggestedCodeChange = hasRootCause && !string.IsNullOrWhiteSpace(ctx.ProposedDiff) ? R(ctx.ProposedDiff) : null,
+            MissingForVerification = missing
         };
     }
 
@@ -190,9 +255,24 @@ public static class InvestigationReportBuilder
         sb.AppendLine();
         sb.AppendLine($"Confidence: **{r.Confidence}** — {r.ConfidenceReason}");
         sb.AppendLine();
+        sb.AppendLine($"KMS version: {r.KmsVersion ?? "unknown"}{(r.KmsVersionSource is null ? "" : $" ({r.KmsVersionSource})")} · Source branch: {r.SourceBranch ?? "—"}{(r.SourceCommit is null ? "" : $" @ {r.SourceCommit[..Math.Min(10, r.SourceCommit.Length)]}")}");
+        sb.AppendLine();
+        if (!string.IsNullOrWhiteSpace(r.CreatedBranch))
+            sb.AppendLine($"**Local branch created: {r.CreatedBranch}** (not checked out; nothing committed or pushed).").AppendLine();
+        else if (!string.IsNullOrWhiteSpace(r.BranchNote))
+            sb.AppendLine("Branch: " + r.BranchNote).AppendLine();
         AppendList(sb, "Confirmed findings (backed by evidence)", r.ConfirmedFindings, "None.");
         AppendList(sb, "Hypotheses (not verified)", r.Hypotheses, "None.");
         AppendList(sb, "Recommendations", r.Recommendations, "None.");
+        if (r.MissingForVerification.Count > 0)
+            AppendList(sb, "What prevented full verification / information needed", r.MissingForVerification, "");
+        if (!string.IsNullOrWhiteSpace(r.ProposedFix))
+        {
+            sb.AppendLine("**Recommended fix (not applied):** " + r.ProposedFix);
+            AppendList(sb, "Affected files", r.AffectedFiles, "Not identified.");
+            if (!string.IsNullOrWhiteSpace(r.SuggestedCodeChange))
+                sb.AppendLine("Suggested code change:").AppendLine("```diff").AppendLine(r.SuggestedCodeChange.Trim()).AppendLine("```").AppendLine();
+        }
         sb.AppendLine("<details><summary>Reproduction, code and evidence details</summary>");
         sb.AppendLine();
         sb.AppendLine("Reproduction: " + r.ReproductionSummary);
@@ -201,6 +281,11 @@ public static class InvestigationReportBuilder
             AppendList(sb, "Skipped (Production read-only)", r.SkippedSteps, "");
         AppendList(sb, "Code findings" + (r.Repository is null ? "" : $" ({r.Repository})"), r.CodeFindings, "None.");
         AppendList(sb, "Similar historical issues (candidates, not confirmed duplicates)", r.SimilarIssues, "None found.");
+        AppendList(sb, "Linked Jira issues", r.LinkedIssues, "None.");
+        AppendList(sb, "Commits in the version branch mentioning the ticket", r.FixCommitsInVersion, "None.");
+        if (!string.IsNullOrWhiteSpace(r.ExpectedResult) || !string.IsNullOrWhiteSpace(r.ActualResult))
+            sb.AppendLine($"Expected: {r.ExpectedResult ?? "—"}").AppendLine($"Actual: {r.ActualResult ?? "—"}").AppendLine();
+        AppendList(sb, "Recent issue history", r.IssueHistory, "None.");
         AppendList(sb, "Evidence (screenshots, passwords masked)", r.Evidence.Select(e => $"{e.FileName} — {e.Caption}").ToList(), "None.");
         sb.AppendLine($"Investigation ID: {r.InvestigationId:N}");
         sb.AppendLine("</details>");

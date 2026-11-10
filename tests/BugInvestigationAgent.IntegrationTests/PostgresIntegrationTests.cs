@@ -38,9 +38,9 @@ public class PostgresIntegrationTests
             return await DatabaseMigrator.MigrateAsync(db);
         })));
 
-        Assert.That(results.SelectMany(r => r).OrderBy(v => v), Is.EqualTo(new[] { 1, 2, 3 }));
+        Assert.That(results.SelectMany(r => r).OrderBy(v => v), Is.EqualTo(new[] { 1, 2, 3, 4, 5 }));
         await using var check = factory.CreateDbContext();
-        Assert.That(await DatabaseMigrator.AppliedVersionsAsync(check), Is.EqualTo(new[] { 1, 2, 3 }));
+        Assert.That(await DatabaseMigrator.AppliedVersionsAsync(check), Is.EqualTo(new[] { 1, 2, 3, 4, 5 }));
         Assert.That(await DatabaseMigrator.MigrateAsync(check), Is.Empty, "re-running is a no-op");
 
         await using var conn = new NpgsqlConnection(_cs);

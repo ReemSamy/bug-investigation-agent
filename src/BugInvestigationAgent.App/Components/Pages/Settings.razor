@@ -8,6 +8,7 @@
 @inject IOptionsSnapshot<AgentOptions> AgentOptions
 @inject IAgentRuntimeResolver RuntimeResolver
 @inject JiraConnectionTester JiraTester
+@inject IntegrationDiagnostics Diagnostics
 
 <PageTitle>Sign in — Bug Investigation Agent</PageTitle>
 
@@ -32,6 +33,13 @@
         <div class="banner @(_messageOk ? "success" : "warn")">@_message</div>
     }
 
+    @if (LocalSettings.UnreadableSecrets.Count > 0)
+    {
+        <div class="banner warn">Could not decrypt: @string.Join(", ", LocalSettings.UnreadableSecrets). Enter them again below
+            (the encryption keys in App_Data/keys were replaced or this is another Windows account).</div>
+    }
+    <p class="muted">Secrets entered on this page are stored encrypted (Windows DPAPI-protected keys) in App_Data and are never shown again.</p>
+
     <h3>Your Atlassian account</h3>
     <div class="field">
         <label>Jira site</label>
@@ -44,8 +52,8 @@
         <div class="muted" style="margin-top:0.35rem">Must be the same account you use in the browser to open tickets.</div>
     </div>
     <div class="field">
-        <label>API token (acts as your password for the API)</label>
-        <input type="password" @bind="_jiraToken" placeholder="Paste API token" autocomplete="current-password" />
+        <label>API token (acts as your password for the API) @(_jiraTokenSaved ? "(saved)" : "(not set)")</label>
+        <input type="password" @bind="_jiraToken" placeholder="@(_jiraTokenSaved ? "•••••• saved — paste a new token to replace" : "Paste API token")" autocomplete="new-password" />
         <div class="muted" style="margin-top:0.35rem">
             1) Open <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noopener">id.atlassian.com → API tokens</a>
             while logged in as yourself<br />
@@ -107,7 +115,40 @@
         <label>OpenAI-compatible model</label>
         <input @bind="_openAiModel" />
     </div>
-    <button class="btn secondary" @onclick="SaveAiOnly">Save AI settings</button>
+    <div class="field">
+        <label>
+            <input type="checkbox" @bind="_dataSharingApproved" />
+            The company has approved sending Jira ticket content and source-code excerpts to the selected provider.
+        </label>
+        <div class="muted" style="margin-top:0.35rem">
+            Until this is ticked, investigations run without the LLM and nothing is sent to it (the connection test below sends only a fixed "Reply with OK").
+            @if (!string.IsNullOrWhiteSpace(_approvalNote)) { <span> @_approvalNote</span> }
+        </div>
+    </div>
+    <div class="btn-row">
+        <button class="btn secondary" @onclick="SaveAiOnly">Save AI settings</button>
+        <button class="btn secondary" disabled="@_busy" @onclick="TestLlmAsync">Test LLM connection</button>
+    </div>
+    @if (!string.IsNullOrWhiteSpace(RuntimeResolver.LlmUnavailableReason))
+    {
+        <div class="banner warn" style="margin-top:0.5rem">Investigations currently run WITHOUT the LLM: @RuntimeResolver.LlmUnavailableReason</div>
+    }
+
+    <h3 style="margin-top:1.75rem">Integration check (read-only)</h3>
+    <p class="muted">Checks the local source workspace (read-only Git commands), KMS documentation folder, environments, repository mapping and LLM settings. Nothing is changed.</p>
+    <button class="btn secondary" disabled="@_busy" @onclick="CheckIntegrationsAsync">Check integrations</button>
+    @if (_checks.Count > 0)
+    {
+        <table style="margin-top:0.5rem; border-collapse:collapse;">
+            @foreach (var c in _checks)
+            {
+                <tr style="border-top:1px solid var(--border);">
+                    <td style="padding-right:0.75rem">@(c.Ok ? "✅" : "⚠️") <b>@c.Area</b></td>
+                    <td>@c.Detail</td>
+                </tr>
+            }
+        </table>
+    }
 </section>
 
 @code {
@@ -123,6 +164,10 @@
     private string _anthropicModel = "";
     private string _openAiModel = "";
     private string _openAiBaseUrl = "";
+    private bool _jiraTokenSaved;
+    private bool _dataSharingApproved;
+    private string? _approvalNote;
+    private IReadOnlyList<DiagnosticResult> _checks = Array.Empty<DiagnosticResult>();
     private string _message = "";
     private bool _messageOk;
     private bool _busy;
@@ -135,7 +180,13 @@
         var jira = LocalSettings.GetEffective();
         _jiraBaseUrl = string.IsNullOrWhiteSpace(jira.BaseUrl) ? "https://ehsq.atlassian.net" : jira.BaseUrl;
         _jiraEmail = jira.Email;
-        _jiraToken = jira.ApiToken;
+        _jiraToken = ""; // never sent back to the browser
+        _jiraTokenSaved = !string.IsNullOrWhiteSpace(jira.ApiToken);
+        var snapshot = LocalSettings.Snapshot;
+        _dataSharingApproved = snapshot.LlmDataSharingApprovedAtUtc is not null;
+        _approvalNote = snapshot.LlmDataSharingApprovedAtUtc is { } at
+            ? $"Recorded by {snapshot.LlmDataSharingApprovedBy ?? "—"} on {at.LocalDateTime:yyyy-MM-dd HH:mm}."
+            : null;
         _workspace = LocalSettings.DefaultWorkspacePath ?? "";
         _providerId = LocalSettings.GetActiveProviderId();
         var llm = LocalSettings.GetEffectiveLlm();
@@ -206,6 +257,33 @@
         _message = "Workspace saved.";
     }
 
+    private async Task TestLlmAsync()
+    {
+        _busy = true;
+        try
+        {
+            var r = await Diagnostics.TestLlmAsync();
+            (_messageOk, _message) = (r.Ok, "LLM connection test: " + r.Detail);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task CheckIntegrationsAsync()
+    {
+        _busy = true;
+        try
+        {
+            _checks = await Diagnostics.CheckLocalAsync();
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
     private void SaveAiOnly()
     {
         var doc = LocalSettings.Snapshot;
@@ -220,6 +298,16 @@
             doc.LlmProviders.OpenAiCompatible.Model = _openAiModel.Trim();
         if (!string.IsNullOrWhiteSpace(_openAiBaseUrl))
             doc.LlmProviders.OpenAiCompatible.BaseUrl = _openAiBaseUrl.Trim();
+        if (_dataSharingApproved && doc.LlmDataSharingApprovedAtUtc is null)
+        {
+            doc.LlmDataSharingApprovedBy = LocalSettings.SignedInDisplayName ?? LocalSettings.SignedInEmail ?? Environment.UserName;
+            doc.LlmDataSharingApprovedAtUtc = DateTimeOffset.UtcNow;
+        }
+        else if (!_dataSharingApproved)
+        {
+            doc.LlmDataSharingApprovedBy = null;
+            doc.LlmDataSharingApprovedAtUtc = null;
+        }
         LocalSettings.Save(doc);
         Load();
         _messageOk = true;

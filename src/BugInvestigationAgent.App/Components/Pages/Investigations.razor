@@ -1,0 +1,63 @@
+@page "/investigations"
+@rendermode InteractiveServer
+@using BugInvestigationAgent.Core.Investigations
+@inject IInvestigationRecordStore Records
+
+<PageTitle>Investigations</PageTitle>
+
+<section class="panel">
+    <h2>Investigations &amp; comment drafts</h2>
+    <p class="muted">Every finished investigation is saved here with its local report. Nothing is posted to Jira.</p>
+    <div class="btn-row">
+        <button class="btn secondary" @onclick="LoadAsync">Refresh</button>
+        <label style="margin-left:1rem"><input type="checkbox" @bind="_pendingOnly" @bind:after="LoadAsync" /> Only still-reproducible bugs</label>
+    </div>
+</section>
+
+<section class="panel">
+    @if (_rows.Count == 0)
+    {
+        <p class="muted">No investigations yet.</p>
+    }
+    else
+    {
+        <table style="width:100%; border-collapse:collapse;">
+            <thead>
+                <tr style="text-align:left;">
+                    <th>When</th><th>Ticket</th><th>Status</th><th>Assessment</th><th>KMS version</th><th>Reproduction</th><th>Confidence</th><th>Local branch</th><th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var r in _rows)
+                {
+                    <tr style="border-top:1px solid var(--border);">
+                        <td>@r.CreatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm")</td>
+                        <td><b>@r.IssueKey</b><div class="muted">@r.IssueSummary</div></td>
+                        <td>@r.ExecutionStatus</td>
+                        <td>@InvestigationAssessor.Label(r.Assessment)@(r.Flags.Count > 0 ? $" (+{string.Join(", ", r.Flags)})" : "")</td>
+                        <td>@(r.KmsVersion ?? "?")</td>
+                        <td>@InvestigationAssessor.Label(r.ReproductionOutcome)</td>
+                        <td>@r.Confidence</td>
+                        <td>@(r.CreatedBranch ?? "—")</td>
+                        <td><a href="/investigations/@r.Id">Open</a></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+@code {
+    private IReadOnlyList<InvestigationRecord> _rows = Array.Empty<InvestigationRecord>();
+    private bool _pendingOnly;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        var all = await Records.ListAsync();
+        _rows = _pendingOnly
+            ? all.Where(r => r.Assessment == BugAssessment.StillExists).ToList()
+            : all;
+    }
+}

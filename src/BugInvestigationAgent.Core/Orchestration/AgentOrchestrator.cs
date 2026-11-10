@@ -133,6 +133,19 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         session.Context.FinalStatusMessage = null;
         session.Context.Investigation.Clear();
         session.Context.CodeCorrelation.Clear();
+        session.Context.ExpectedResult = null;
+        session.Context.ActualResult = null;
+        session.Context.LinkedIssues.Clear();
+        session.Context.ResolvedLinkedIssueKeys.Clear();
+        session.Context.IssueHistory.Clear();
+        session.Context.DeployedVersion = null;
+        session.Context.DeployedVersionSource = null;
+        session.Context.SourceVersionRef = null;
+        session.Context.SourceVersionCommit = null;
+        session.Context.SourceVersionNote = null;
+        session.Context.FixCommitsInVersion.Clear();
+        session.Context.CreatedBranch = null;
+        session.Context.BranchNote = null;
         session.Context.CustomFields.Remove("stepsInferredFromTicket");
         session.Context.CustomFields.Remove("inferredForTicket");
         session.Context.CustomFields.Remove("stepsFromJira");
@@ -180,12 +193,34 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         {
             await _browserSessions.CloseAsync(sessionId);
             _sessionCredentials.Clear(sessionId);
+            // Record the outcome before clearing this run's secrets, so the record is redacted with them.
+            await NotifyFinishedAsync(session);
             _redactor.ClearSessionSecrets(sessionId);
             lock (_runGate)
             {
                 if (_runs.Remove(sessionId, out var cts))
                     cts.Dispose();
             }
+        }
+    }
+
+    /// <summary>
+    /// Hands the finished run to every registered <see cref="Investigations.IInvestigationCompletionSink"/> (the local
+    /// app persists records + comment drafts). Hosts without sinks are unaffected. A sink failure never fails the run.
+    /// </summary>
+    private async Task NotifyFinishedAsync(AgentSession session)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            foreach (var sink in scope.ServiceProvider.GetServices<Investigations.IInvestigationCompletionSink>())
+                await sink.OnInvestigationFinishedAsync(session, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Saving the investigation record failed for {Session}: {Error}", session.Id, _redactor.Redact(ex.Message));
+            session.Context.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Could not save the investigation record: {_redactor.Redact(ex.Message)}");
+            session.NotifyChanged();
         }
     }
 
@@ -384,8 +419,9 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 session.MissingInfoWaiter.TrySetResult(true);
                 _ = Task.Run(async () =>
                 {
-                    using var continueScope = _scopeFactory.CreateScope();
-                    await ContinueAfterContextReadyAsync(continueScope.ServiceProvider, session, CancellationToken.None);
+                    using (var continueScope = _scopeFactory.CreateScope())
+                        await ContinueAfterContextReadyAsync(continueScope.ServiceProvider, session, CancellationToken.None);
+                    await NotifyFinishedAsync(session);
                 }, CancellationToken.None);
             }
         }
@@ -546,7 +582,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
             foreach (var lesson in (lessons ?? []).Take(10))
                 ctx.AppliedMemoryLessonIds.Add(lesson.Id.ToString());
             await ExecuteSkillAsync(sp, SkillIds.CodeInvestigation, session, cancellationToken);
-            analysed = !ctx.CustomFields.ContainsKey("investigationBlockedNoLlm");
+            analysed = !ctx.CustomFields.ContainsKey("investigationBlockedNoLlm") && !ctx.CustomFields.ContainsKey("codeAnalysisSkipped");
         }
 
         await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
@@ -557,6 +593,16 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 : ". No source workspace is available, so no code analysis was done. Review Evidence.");
         session.SetState(AgentState.Completed, ctx.FinalStatusMessage);
     }
+
+    /// <summary>Read-only: deployed version → matching source branch + fix commits (skipped when the skill is not registered).</summary>
+    private async Task ResolveSourceVersionAsync(IServiceProvider sp, AgentSession session, CancellationToken cancellationToken)
+    {
+        if (TryGetSkill(sp, "source-version") is { } skill && skill.CanExecute(session.Context, _permissions))
+            await ExecuteSkillAsync(sp, "source-version", session, cancellationToken);
+    }
+
+    private static ISkill? TryGetSkill(IServiceProvider sp, string id) =>
+        sp.GetServices<ISkill>().FirstOrDefault(s => string.Equals(s.SkillId, id, StringComparison.OrdinalIgnoreCase));
 
     private async Task ContinueAfterContextReadyAsync(IServiceProvider sp, AgentSession session, CancellationToken cancellationToken)
     {
@@ -630,6 +676,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                     return;
                 case ReproductionOutcome.NotReproduced:
                 case ReproductionOutcome.Ambiguous:
+                    await ResolveSourceVersionAsync(sp, session, cancellationToken);
                     await InvestigateWithoutConfirmedReproductionAsync(sp, memoryStore, session, cancellationToken);
                     return;
                 case ReproductionOutcome.Reproduced:
@@ -639,6 +686,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                     return;
             }
 
+            await ResolveSourceVersionAsync(sp, session, cancellationToken);
             if (!MissingInfoResolver.IsLocalWorkspace(session.Context.WorkspacePath))
             {
                 await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
@@ -667,6 +715,10 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
                 session.SetState(AgentState.Completed, session.Context.FinalStatusMessage);
                 return;
             }
+
+            // Still reproducible: one new local branch from the version branch (no checkout/commit/push).
+            if (TryGetSkill(sp, "local-branch") is { } branchSkill && branchSkill.CanExecute(session.Context, _permissions))
+                await ExecuteSkillAsync(sp, "local-branch", session, cancellationToken);
 
             if (!_permissions.IsAllowed(AgentPermission.ModifyCode))
             {
@@ -946,6 +998,8 @@ public interface IAgentRuntimeResolver
 {
     Abstractions.IAgentRuntime GetCurrent();
     IReadOnlyList<string> AvailableProviderIds { get; }
+    /// <summary>Why no real LLM is used right now (null when one is). Safe to show: never contains keys.</summary>
+    string? LlmUnavailableReason => null;
 }
 
 public sealed class AgentRuntimeResolver : IAgentRuntimeResolver
@@ -961,13 +1015,40 @@ public sealed class AgentRuntimeResolver : IAgentRuntimeResolver
 
     public IReadOnlyList<string> AvailableProviderIds => _runtimes.Select(r => r.ProviderId).ToList();
 
+    private static readonly string[] LocalOnlyProviders = ["null", "cursor", "azure-openai"]; // offline/stub: never send data
+
     public Abstractions.IAgentRuntime GetCurrent()
     {
         // Read per call: the provider chosen in Settings applies to the next investigation step.
         var active = _settings.ActiveProviderId;
         var runtime = _runtimes.FirstOrDefault(r =>
             string.Equals(r.ProviderId, active, StringComparison.OrdinalIgnoreCase));
+        // Company data (Jira content, source code) is sent to an external provider only after approval is recorded.
+        if (runtime is not null && !LocalOnlyProviders.Contains(runtime.ProviderId, StringComparer.OrdinalIgnoreCase) &&
+            !_settings.ExternalDataSharingApproved)
+            runtime = _runtimes.FirstOrDefault(r => string.Equals(r.ProviderId, "null", StringComparison.OrdinalIgnoreCase));
         return runtime ?? _runtimes.FirstOrDefault()
             ?? throw new InvalidOperationException("No AI runtime providers are registered.");
+    }
+
+    public string? LlmUnavailableReason
+    {
+        get
+        {
+            var active = _settings.ActiveProviderId;
+            if (string.IsNullOrWhiteSpace(active) || string.Equals(active, "null", StringComparison.OrdinalIgnoreCase))
+                return "No LLM provider is selected (Sign in / Account → AI provider).";
+            if (!_runtimes.Any(r => string.Equals(r.ProviderId, active, StringComparison.OrdinalIgnoreCase)))
+                return $"The selected LLM provider '{active}' does not exist.";
+            if (LocalOnlyProviders.Contains(active, StringComparer.OrdinalIgnoreCase))
+                return $"The selected LLM provider '{active}' is not implemented; choose anthropic or openai-compatible.";
+            if (!_settings.ExternalDataSharingApproved)
+                return "Company approval to send Jira content and source code to the LLM provider is not recorded (Sign in / Account → AI provider).";
+            var llm = _settings.Current;
+            var key = active.Equals("anthropic", StringComparison.OrdinalIgnoreCase) ? llm.Anthropic.ApiKey : llm.OpenAiCompatible.ApiKey;
+            if (string.IsNullOrWhiteSpace(key))
+                return $"No API key is saved for '{active}'.";
+            return null;
+        }
     }
 }

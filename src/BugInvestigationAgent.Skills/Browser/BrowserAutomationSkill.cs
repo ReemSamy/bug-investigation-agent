@@ -221,6 +221,11 @@ public sealed class BrowserAutomationSkill : ISkill
                 await EvidenceScreenshots.CaptureAsync(page, _options, ctx, "02-after-login",
                     $"Signed in to {env.DisplayName} — application home before navigating into the ticket feature",
                     EvidenceCategories.PostLogin, env.Login);
+                (ctx.DeployedVersion, ctx.DeployedVersionSource) =
+                    await DeployedVersionDetector.DetectAsync(page, env, Math.Min(_options.Browser.ActionTimeoutMs, 20_000));
+                progress?.Report(ctx.DeployedVersion is null
+                    ? $"KMS version on {env.DisplayName}: unknown — {ctx.DeployedVersionSource}"
+                    : $"KMS version on {env.DisplayName}: {ctx.DeployedVersion} (from {ctx.DeployedVersionSource}).");
                 ctx.ReproductionOutcome = ReproductionOutcome.NotStarted;
                 ctx.ReproductionNotes = null;
                 progress?.Report("Browser session ready (kept open for reproduction).");

@@ -18,12 +18,11 @@ public sealed class HostedOnlyCurrentUserAccessor : ICurrentUserAccessor
 /// <summary>Initial team rollout: everything that could change code, repositories or deployments is off, whatever the configuration says.</summary>
 public static class HostedPermissions
 {
-    public const AgentPermission ForbiddenInRollout =
-        AgentPermission.ModifyCode | AgentPermission.RunValidation | AgentPermission.GitCommit | AgentPermission.GitPush |
-        AgentPermission.CreatePullRequest | AgentPermission.TriggerCi | AgentPermission.Deploy;
+    // Hosted workers have no developer clone: no local branches there either.
+    public const AgentPermission ForbiddenInRollout = ReadOnlyRollout.Forbidden | AgentPermission.CreateLocalBranch;
 
     public static IPermissionGate Mask(IPermissionGate configured) =>
-        new PermissionGate(configured.Allowed & ~ForbiddenInRollout);
+        new PermissionGate(ReadOnlyRollout.Mask(configured).Allowed & ~AgentPermission.CreateLocalBranch);
 }
 
 /// <summary>

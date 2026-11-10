@@ -87,6 +87,23 @@ public static class DatabaseMigrator
         {
             await m.AddColumnIfMissingAsync("InvestigationJobs", "ContextSnapshotJson", "TEXT NULL", "text NULL", ct);
             await m.AddColumnIfMissingAsync("InvestigationJobs", "AwaitingSinceUnixMs", "INTEGER NOT NULL DEFAULT 0", "bigint NOT NULL DEFAULT 0", ct);
+        }),
+        // 4: durable investigation records (report, Jira comment draft, review + publication audit) and legacy batches.
+        new(4, "investigation-records-and-batches", async (m, ct) =>
+        {
+            string[] tables = ["InvestigationRecords", "LegacyBatches", "LegacyBatchItems"];
+            foreach (var statement in SchemaUpgrader.SplitStatements(m.Db.Database.GenerateCreateScript()))
+            {
+                var sql = SchemaUpgrader.MakeIdempotent(statement);
+                if (sql is not null && tables.Any(t => sql.Contains($"\"{t}\"", StringComparison.Ordinal)))
+                    await m.ExecuteAsync(sql, ct);
+            }
+        }),
+        // 5: version-aware investigation (deployed KMS version, source branch, created local branch, recommended fix).
+        new(5, "investigation-version-and-branch", async (m, ct) =>
+        {
+            foreach (var column in new[] { "KmsVersion", "SourceBranch", "CreatedBranch", "BranchNote", "ProposedFix", "AffectedFilesCsv" })
+                await m.AddColumnIfMissingAsync("InvestigationRecords", column, "TEXT NULL", "text NULL", ct);
         })
     ];
 
