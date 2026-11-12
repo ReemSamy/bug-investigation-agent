@@ -1,0 +1,47 @@
+@page
+@model IndexModel
+@{ ViewData["Title"] = "Dashboard"; }
+
+<div class="card mb-4">
+    <div class="card-body">
+        <h1 class="h4">Start an investigation</h1>
+        <p class="text-muted mb-3">Paste a Jira ticket URL (bug verification) or an Azure DevOps pull request URL (PR review).</p>
+        @if (!Model.CredentialsReady)
+        {
+            <div class="alert alert-warning">Credentials are not configured yet. Enter them on the <a asp-page="/Settings">Credentials &amp; configuration</a> page first.</div>
+        }
+        <form method="post" class="row g-2">
+            <div class="col-md-10">
+                <input asp-for="Url" class="form-control" placeholder="https://your-site.atlassian.net/browse/KEY-123  or  https://dev.azure.com/org/project/_git/repo/pullrequest/42" />
+                <span asp-validation-for="Url" class="text-danger small"></span>
+            </div>
+            <div class="col-md-2 d-grid">
+                <button class="btn btn-primary" type="submit">Start Investigation</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<h2 class="h5">Recent investigations</h2>
+@if (Model.Recent.Count == 0)
+{
+    <p class="text-muted">None yet.</p>
+}
+else
+{
+    <table class="table table-sm table-hover bg-white">
+        <thead><tr><th>Started (UTC)</th><th>Target</th><th>Status</th><th>Result</th></tr></thead>
+        <tbody>
+        @foreach (var inv in Model.Recent)
+        {
+            <tr>
+                <td>@inv.CreatedAt.ToString("yyyy-MM-dd HH:mm")</td>
+                <td><a asp-page="/Investigation" asp-route-id="@inv.Id">@inv.Target.DisplayName</a>
+                    <span class="text-muted small">@(inv.Issue?.Summary ?? inv.PullRequest?.Title)</span></td>
+                <td><span class="badge text-bg-@IndexModel.StepColor(inv.Step)">@inv.Step</span></td>
+                <td>@(inv.Report is null ? "" : inv.Target.Kind == TargetKind.JiraIssue ? ReportFormatter.OutcomeLabel(inv.Report.Outcome) : inv.Report.PrVerdict)</td>
+            </tr>
+        }
+        </tbody>
+    </table>
+}

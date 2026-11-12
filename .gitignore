@@ -11,3 +11,7 @@ App_Data/
 
 # Machine-local configuration (environment URLs, overrides) — never commit
 **/appsettings.Local.json
+
+# AI.BugInvestigationTool: investigation evidence (screenshots, reports, ticket data) stays local
+Evidence/*
+!Evidence/.gitkeep

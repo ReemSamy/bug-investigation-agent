@@ -4,8 +4,26 @@
     {
       "name": "bug-investigation-agent",
       "runtimeExecutable": "dotnet",
-      "runtimeArgs": ["run", "--project", "src/BugInvestigationAgent.App", "--launch-profile", "http"],
+      "runtimeArgs": [
+        "run",
+        "--project",
+        "src/BugInvestigationAgent.App",
+        "--launch-profile",
+        "http"
+      ],
       "port": 5149
+    },
+    {
+      "name": "ai-bug-investigation-tool",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": [
+        "run",
+        "--project",
+        "src/AI.BugInvestigationTool",
+        "--launch-profile",
+        "http"
+      ],
+      "port": 5180
     }
   ]
 }

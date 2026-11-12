@@ -1,0 +1,381 @@
+@page "{id}"
+@model InvestigationModel
+@{
+    var inv = Model.Inv!;
+    var r = inv.Report;
+    ViewData["Title"] = inv.Target.DisplayName;
+    var steps = inv.Target.Kind == TargetKind.JiraIssue
+        ? new[] { InvestigationStep.JiraDataCollection, InvestigationStep.ContextValidation, InvestigationStep.BrowserInvestigation, InvestigationStep.CodeInvestigation, InvestigationStep.ClaudeAnalysis, InvestigationStep.ReportGeneration, InvestigationStep.JiraPublishing }
+        : new[] { InvestigationStep.PullRequestCollection, InvestigationStep.TestExecution, InvestigationStep.ClaudeAnalysis, InvestigationStep.ReportGeneration };
+    var reached = inv.Progress.Select(p => p.Step).ToHashSet();
+}
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+    <div>
+        <h1 class="h4 mb-1">@inv.Target.DisplayName <small class="text-muted">@(inv.Issue?.Summary ?? inv.PullRequest?.Title)</small></h1>
+        <div class="small text-muted"><a href="@inv.Target.Url" target="_blank" rel="noopener noreferrer">@inv.Target.Url</a> · ID <code>@inv.Id</code></div>
+    </div>
+    <div class="d-flex gap-2">
+        @if (Model.Running)
+        {
+            <form method="post" asp-page-handler="Cancel" asp-route-id="@inv.Id"><button class="btn btn-outline-danger btn-sm">Cancel</button></form>
+        }
+        else
+        {
+            <form method="post" asp-page-handler="Rerun" asp-route-id="@inv.Id"><button class="btn btn-outline-secondary btn-sm">Run again</button></form>
+        }
+    </div>
+</div>
+
+@* ---------- progress ---------- *@
+<div class="card mb-4"><div class="card-body">
+    <div class="d-flex flex-wrap gap-2 mb-3">
+        @foreach (var s in steps)
+        {
+            var cls = inv.Step == s && Model.Running ? "primary" : reached.Contains(s) ? "success" : "light text-dark border";
+            <span class="badge text-bg-@cls">@s</span>
+        }
+        <span class="badge text-bg-@IndexModel.StepColor(inv.Step) ms-auto" id="state">@inv.Step@(Model.Running ? " (running…)" : "")</span>
+    </div>
+    @if (inv.Error is not null)
+    {
+        <div class="alert alert-danger mb-2">@inv.Error</div>
+    }
+    <div class="progress-log bg-white border rounded p-2" id="log">
+        @foreach (var p in inv.Progress)
+        {
+            <div><span class="text-muted">@p.At.ToString("HH:mm:ss")</span> <strong>@p.Step</strong> @p.Message</div>
+        }
+    </div>
+</div></div>
+
+@* ---------- missing information ---------- *@
+@if (inv.Step == InvestigationStep.WaitingForInput)
+{
+    <div class="card border-warning mb-4"><div class="card-body">
+        <h2 class="h5">Information needed</h2>
+        <p class="small text-muted">Browser testing has not started. Provide the required values and continue.</p>
+        <form method="post" asp-page-handler="ProvideInfo" asp-route-id="@inv.Id">
+            @foreach (var m in inv.MissingInfo)
+            {
+                <div class="mb-3">
+                    <label class="form-label">@m.Question
+                        @if (m.Required) { <span class="badge text-bg-danger">required</span> } else { <span class="badge text-bg-secondary">optional</span> }
+                    </label>
+                    @if (m.Key == MissingInfoDetector.EnvironmentLogin)
+                    {
+                        <div class="row g-2">
+                            <div class="col"><input name="envUsername" class="form-control" placeholder="Username" autocomplete="off" /></div>
+                            <div class="col"><input name="envPassword" type="password" class="form-control" placeholder="Password" autocomplete="new-password" /></div>
+                            <div class="col-auto form-check mt-2"><input class="form-check-input" type="checkbox" name="info[noLoginRequired]" value="true" id="nologin" /><label for="nologin" class="form-check-label small">No login required</label></div>
+                        </div>
+                    }
+                    else if (m.Key == MissingInfoDetector.EnvironmentUrl)
+                    {
+                        <input name="info[environmentUrl]" class="form-control mb-1" value="@inv.UserInfo.GetValueOrDefault("environmentUrl")" placeholder="https://qa.example.com" />
+                        <input name="allowHost" class="form-control" placeholder="Allow this host for browser testing (e.g. qa.example.com)" />
+                        @foreach (var u in MissingInfoDetector.UrlsInTicket(inv.Issue))
+                        {
+                            <div class="small text-muted">Mentioned in ticket (untrusted): @u</div>
+                        }
+                    }
+                    else
+                    {
+                        <textarea name="info[@m.Key]" class="form-control" rows="@(m.Key == MissingInfoDetector.ReproductionSteps ? 4 : 2)">@inv.UserInfo.GetValueOrDefault(m.Key)</textarea>
+                    }
+                </div>
+            }
+            <button class="btn btn-warning">Continue investigation</button>
+        </form>
+    </div></div>
+}
+
+@* ---------- context review ---------- *@
+@if (inv.Issue is { } issue)
+{
+    <details class="card mb-4" open="@(r is null)"><summary class="card-header">Collected Jira information</summary><div class="card-body small">
+        <div class="row">
+            <div class="col-md-6">
+                <dl class="row mb-0">
+                    <dt class="col-4">Type / Status</dt><dd class="col-8">@issue.IssueType / @issue.Status</dd>
+                    <dt class="col-4">Priority</dt><dd class="col-8">@issue.Priority</dd>
+                    <dt class="col-4">Versions</dt><dd class="col-8">Affects: @string.Join(", ", issue.AffectedVersions) · Fix: @string.Join(", ", issue.FixVersions)</dd>
+                    <dt class="col-4">Components</dt><dd class="col-8">@string.Join(", ", issue.Components)</dd>
+                    <dt class="col-4">Labels</dt><dd class="col-8">@string.Join(", ", issue.Labels)</dd>
+                    <dt class="col-4">Assignee / Reporter</dt><dd class="col-8">@issue.Assignee / @issue.Reporter</dd>
+                    <dt class="col-4">Sprint</dt><dd class="col-8">@string.Join(", ", issue.Sprints)</dd>
+                    <dt class="col-4">Parent</dt><dd class="col-8">@issue.Parent</dd>
+                    <dt class="col-4">Links</dt><dd class="col-8">@string.Join("; ", issue.LinkedIssues)</dd>
+                    <dt class="col-4">Subtasks</dt><dd class="col-8">@string.Join("; ", issue.Subtasks)</dd>
+                    @foreach (var (k, v) in issue.CustomFields.Take(25))
+                    {
+                        <dt class="col-4">@k</dt><dd class="col-8">@v</dd>
+                    }
+                </dl>
+            </div>
+            <div class="col-md-6">
+                <h3 class="h6">Description</h3><pre class="wrap border rounded p-2 bg-white">@issue.Description</pre>
+                @if (inv.Understanding is { } u)
+                {
+                    <h3 class="h6">Claude's reading</h3>
+                    <p><strong>Expected:</strong> @u.ExpectedBehavior<br /><strong>Actual:</strong> @u.ActualBehavior</p>
+                    <ol>
+                        @foreach (var s in u.ReproductionSteps)
+                        {
+                            <li>@s</li>
+                        }
+                    </ol>
+                }
+                <h3 class="h6">Comments (@issue.Comments.Count) · Attachments (@issue.Attachments.Count) · History (@issue.History.Count)</h3>
+                @foreach (var c in issue.Comments.TakeLast(5))
+                {
+                    <div class="border-start ps-2 mb-2"><strong>@c.Author</strong> @c.Created?.ToString("yyyy-MM-dd"): @c.Body</div>
+                }
+            </div>
+        </div>
+    </div></details>
+}
+
+@* ---------- report ---------- *@
+@if (r is not null)
+{
+    <div class="card mb-4"><div class="card-body">
+        @if (inv.Target.Kind == TargetKind.JiraIssue)
+        {
+            <h2 class="h5">Outcome: <span class="badge text-bg-@InvestigationModel.OutcomeColor(r.Outcome)">@ReportFormatter.OutcomeLabel(r.Outcome)</span>
+                <small class="text-muted">confidence @r.Confidence.ToString("P0")</small></h2>
+            @if (r.ProposedOutcome is not null)
+            {
+                <div class="alert alert-secondary small">Claude proposed @ReportFormatter.OutcomeLabel(r.ProposedOutcome.Value); adjusted because @r.OutcomeAdjustmentReason.</div>
+            }
+        }
+        else
+        {
+            <h2 class="h5">Advisory verdict: <span class="badge text-bg-info">@r.PrVerdict</span> <small class="text-muted">confidence @r.Confidence.ToString("P0") · nothing is approved or posted automatically</small></h2>
+        }
+        <p>@r.Summary</p>
+
+        @if (inv.Target.Kind == TargetKind.JiraIssue)
+        {
+            <div class="row small">
+                <div class="col-md-4"><h3 class="h6">Expected</h3><p>@r.ExpectedBehavior</p></div>
+                <div class="col-md-4"><h3 class="h6">Actual</h3><p>@r.ActualBehavior</p></div>
+                <div class="col-md-4"><h3 class="h6">Reproduction</h3><p>@r.ReproductionResult</p>
+                    @if (inv.Browser is { } b)
+                    {
+                        <ul>
+                            @foreach (var s in b.StepsExecuted)
+                            {
+                                <li>@s</li>
+                            }
+                        </ul>
+                    }
+                </div>
+            </div>
+            <h3 class="h6">Root cause <span class="badge text-bg-@(r.RootCauseStatus == "confirmed" ? "success" : "secondary")">@r.RootCauseStatus</span></h3>
+            <p class="small">@r.RootCause</p>
+        }
+
+        @if (inv.PullRequest is { } pr)
+        {
+            <h3 class="h6">Changed files (@pr.Files.Count, +@pr.Additions/-@pr.Deletions) · <code>@pr.SourceBranch</code> → <code>@pr.TargetBranch</code></h3>
+            <details class="mb-3 small"><summary>Show files and diffs</summary>
+                @foreach (var f in pr.Files)
+                {
+                    <div class="mt-2"><code>@f.Path</code> @f.ChangeType +@f.Additions/-@f.Deletions @f.SkippedReason</div>
+                    <pre class="wrap bg-white border p-1">@f.Diff</pre>
+                }
+            </details>
+        }
+
+        @if (r.Findings.Count > 0)
+        {
+            <h3 class="h6">Findings</h3>
+            <table class="table table-sm small bg-white">
+                <thead><tr><th>#</th><th>Severity</th><th>Finding</th><th>Location</th></tr></thead>
+                <tbody>
+                @for (var i = 0; i < r.Findings.Count; i++)
+                {
+                    var f = r.Findings[i];
+                    var sev = f.Severity == "Critical" ? "danger" : f.Severity == "Medium" ? "warning" : "secondary";
+                    <tr>
+                        <td>@(i + 1)</td>
+                        <td><span class="badge text-bg-@sev">@f.Severity</span></td>
+                        <td><strong>@f.Title</strong><br />@f.Detail<br /><em>Fix:</em> @f.Recommendation</td>
+                        <td><code>@f.Reference</code>@(f.ReferenceUnverified ? " ⚠ unverified" : "")</td>
+                    </tr>
+                }
+                </tbody>
+            </table>
+        }
+        @if (r.CodeReferences.Count > 0)
+        {
+            <h3 class="h6">Code references</h3>
+            <ul class="small">
+                @foreach (var c in r.CodeReferences)
+                {
+                    <li><code>@c</code> — @c.Note</li>
+                }
+            </ul>
+        }
+        @if (r.Recommendations.Count > 0)
+        {
+            <h3 class="h6">Recommendations</h3>
+            <ul class="small">
+                @foreach (var x in r.Recommendations)
+                {
+                    <li>@x</li>
+                }
+            </ul>
+        }
+        @if (r.MissingTests.Count > 0)
+        {
+            <h3 class="h6">Missing tests</h3>
+            <ul class="small">
+                @foreach (var x in r.MissingTests)
+                {
+                    <li>@x</li>
+                }
+            </ul>
+        }
+        @if (inv.Tests is { } t)
+        {
+            <h3 class="h6">Test results</h3>
+            <p class="small">@(t.Executed ? $"Exit code {t.ExitCode}. " : "Not executed: ")@t.Summary</p>
+        }
+        @if (!string.IsNullOrWhiteSpace(r.OverallAssessment))
+        {
+            <h3 class="h6">Overall assessment</h3>
+            <p class="small">@r.OverallAssessment</p>
+        }
+        @if (r.Limitations.Count > 0)
+        {
+            <h3 class="h6">Limitations</h3>
+            <ul class="small text-muted">
+                @foreach (var x in r.Limitations)
+                {
+                    <li>@x</li>
+                }
+            </ul>
+        }
+    </div></div>
+}
+
+@* ---------- evidence ---------- *@
+@if (inv.Evidence.Count > 0 || inv.Browser is not null)
+{
+    <div class="card mb-4"><div class="card-body">
+        <h2 class="h5">Evidence</h2>
+        <div class="row g-3">
+            @foreach (var e in inv.Evidence.Where(e => e.Kind == "screenshot" && e.File is not null))
+            {
+                <div class="col-md-4">
+                    <a href="/evidence/@inv.Id/@e.File" target="_blank"><img class="shot" src="/evidence/@inv.Id/@e.File" alt="@e.Label" /></a>
+                    <div class="small">@e.Label</div>
+                </div>
+            }
+        </div>
+        @if (inv.Browser is { } br)
+        {
+            @if (br.Error is not null)
+            {
+                <div class="alert alert-danger small mt-3">Browser: @br.Error</div>
+            }
+            @if (br.ConsoleErrors.Count > 0)
+            {
+                <h3 class="h6 mt-3">Console errors</h3>
+                <pre class="wrap small">@string.Join("\n", br.ConsoleErrors.Take(30))</pre>
+            }
+            @if (br.NetworkFailures.Count > 0)
+            {
+                <h3 class="h6 mt-3">Network failures</h3>
+                <pre class="wrap small">@string.Join("\n", br.NetworkFailures.Take(30))</pre>
+            }
+        }
+        <ul class="small mt-2">
+            @foreach (var e in inv.Evidence.Where(e => e.Kind != "screenshot"))
+            {
+                <li>[@e.Kind] @e.Label @e.File</li>
+            }
+        </ul>
+    </div></div>
+}
+
+@* ---------- approvals ---------- *@
+@if (r is not null && !Model.Running && inv.Target.Kind == TargetKind.JiraIssue)
+{
+    <div class="card border-primary mb-4"><div class="card-body">
+        <h2 class="h5">Review and approve Jira updates</h2>
+        <p class="small text-muted">Nothing is sent to Jira until you tick the confirmation and submit.</p>
+        <form method="post" asp-page-handler="PublishJira" asp-route-id="@inv.Id">
+            <div class="form-check"><input class="form-check-input" type="checkbox" name="postComment" value="true" id="pc" checked /><label class="form-check-label" for="pc">Post this comment</label></div>
+            <textarea name="commentText" class="form-control font-monospace small my-2" rows="16">@inv.JiraCommentDraft</textarea>
+            <div class="form-check mb-2"><input class="form-check-input" type="checkbox" name="attachScreenshots" value="true" id="as" checked /><label class="form-check-label" for="as">Upload screenshots as attachments</label></div>
+            <label class="form-label">Status change (optional)@(r.ProposedJiraAction is null ? "" : $" — proposed: {r.ProposedJiraAction}")</label>
+            <select name="transition" class="form-select mb-2">
+                <option value="">No status change</option>
+                @foreach (var tr in Model.Transitions)
+                {
+                    <option value="@tr.Name">@tr.Name → @tr.ToStatus</option>
+                }
+            </select>
+            @if (Model.TransitionError is not null)
+            {
+                <div class="small text-danger mb-2">Transitions unavailable: @Model.TransitionError</div>
+            }
+            @if (r.Outcome is InvestigationOutcome.Inconclusive or InvestigationOutcome.Blocked)
+            {
+                <div class="small text-warning mb-2">Closing transitions are refused for @ReportFormatter.OutcomeLabel(r.Outcome) outcomes.</div>
+            }
+            <div class="form-check mb-2"><input class="form-check-input" type="checkbox" name="confirm" value="true" id="cf" /><label class="form-check-label" for="cf">I reviewed the content and approve these Jira changes.</label></div>
+            <button class="btn btn-primary">Publish to Jira</button>
+        </form>
+    </div></div>
+}
+@if (r is not null && !Model.Running && inv.Target.Kind == TargetKind.PullRequest)
+{
+    <div class="card border-primary mb-4"><div class="card-body">
+        <h2 class="h5">Publish PR comment</h2>
+        <form method="post" asp-page-handler="PublishPr" asp-route-id="@inv.Id">
+            <textarea name="commentText" class="form-control font-monospace small mb-2" rows="12">@ReportFormatter.PrCommentMarkdown(inv)</textarea>
+            <div class="form-check mb-2"><input class="form-check-input" type="checkbox" name="confirm" value="true" id="cfp" /><label class="form-check-label" for="cfp">I approve posting this comment thread. (The PR is never approved, completed or merged by this tool.)</label></div>
+            <button class="btn btn-primary">Post comment</button>
+        </form>
+    </div></div>
+}
+@if (inv.Publishing.Count > 0)
+{
+    <div class="card mb-4"><div class="card-body small"><h2 class="h6">Publishing history</h2>
+        <ul>
+            @foreach (var p in inv.Publishing)
+            {
+                <li>@p.At.ToString("u") @p.Action: <strong class="@(p.Success ? "text-success" : "text-danger")">@(p.Success ? "OK" : "FAILED")</strong> @p.Detail</li>
+            }
+        </ul>
+    </div></div>
+}
+
+@section Scripts {
+    @if (Model.Running)
+    {
+        <script>
+            // Poll progress; reload when the run finishes. The status JSON contains no secrets.
+            const id = @Json.Serialize(inv.Id);
+            setInterval(async () => {
+                const res = await fetch(`/api/investigations/${encodeURIComponent(id)}/status`);
+                if (!res.ok) return;
+                const s = await res.json();
+                const log = document.getElementById('log');
+                log.innerHTML = '';
+                for (const p of s.progress) {
+                    const d = document.createElement('div');
+                    d.textContent = `${new Date(p.at).toLocaleTimeString()} ${p.step} ${p.message}`;
+                    log.appendChild(d);
+                }
+                log.scrollTop = log.scrollHeight;
+                document.getElementById('state').textContent = s.step + (s.running ? ' (running…)' : '');
+                if (!s.running) location.reload();
+            }, 2000);
+        </script>
+    }
+}

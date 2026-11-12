@@ -1,0 +1,50 @@
+{
+  "id": "10042",
+  "key": "SHOP-42",
+  "names": {
+    "summary": "Summary",
+    "customfield_10020": "Sprint",
+    "customfield_10100": "Customer Impact",
+    "customfield_10200": "Root Cause Area",
+    "customfield_10300": "Empty Field"
+  },
+  "fields": {
+    "summary": "Saving an order shows a server error",
+    "description": {
+      "type": "doc", "version": 1,
+      "content": [
+        { "type": "paragraph", "content": [ { "type": "text", "text": "Steps to reproduce:" } ] },
+        { "type": "orderedList", "content": [
+          { "type": "listItem", "content": [ { "type": "paragraph", "content": [ { "type": "text", "text": "Open the Orders page" } ] } ] },
+          { "type": "listItem", "content": [ { "type": "paragraph", "content": [ { "type": "text", "text": "Click Save" } ] } ] }
+        ] },
+        { "type": "paragraph", "content": [ { "type": "text", "text": "Expected result: the order is saved and a confirmation is shown." } ] },
+        { "type": "paragraph", "content": [ { "type": "text", "text": "Actual result: an error message 'Could not save order' appears." } ] }
+      ]
+    },
+    "environment": { "type": "doc", "version": 1, "content": [ { "type": "paragraph", "content": [ { "type": "text", "text": "QA: https://qa.example.com/app" } ] } ] },
+    "priority": { "name": "High" },
+    "status": { "name": "Ready for QA" },
+    "issuetype": { "name": "Bug" },
+    "versions": [ { "name": "2.3.0" } ],
+    "fixVersions": [ { "name": "2.3.1" } ],
+    "components": [ { "name": "Orders" } ],
+    "labels": [ "regression", "orders" ],
+    "assignee": { "displayName": "Dev One" },
+    "reporter": { "displayName": "QA Two" },
+    "parent": { "key": "SHOP-1", "fields": { "summary": "Orders epic" } },
+    "subtasks": [ { "key": "SHOP-43", "fields": { "summary": "Add test", "status": { "name": "To Do" } } } ],
+    "issuelinks": [
+      { "type": { "inward": "is blocked by", "outward": "blocks" }, "outwardIssue": { "key": "SHOP-50", "fields": { "summary": "Release 2.3.1" } } },
+      { "type": { "inward": "is duplicated by", "outward": "duplicates" }, "inwardIssue": { "key": "SHOP-12", "fields": { "summary": "Order save fails" } } }
+    ],
+    "attachment": [
+      { "id": "900", "filename": "error.log", "mimeType": "text/plain", "size": 40, "content": "https://acme.atlassian.net/rest/api/3/attachment/content/900" },
+      { "id": "901", "filename": "evil.txt", "mimeType": "text/plain", "size": 10, "content": "https://evil.example.net/steal" }
+    ],
+    "customfield_10020": [ { "id": 7, "name": "Sprint 14", "state": "active" } ],
+    "customfield_10100": { "value": "High" },
+    "customfield_10200": [ { "value": "API" }, { "value": "Database" } ],
+    "customfield_10300": null
+  }
+}
