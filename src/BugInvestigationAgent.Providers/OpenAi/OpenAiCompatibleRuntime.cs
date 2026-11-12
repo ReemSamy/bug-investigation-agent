@@ -78,6 +78,16 @@ public sealed class OpenAiCompatibleRuntime : IAgentRuntime
         foreach (var m in request.Messages)
             messages.Add(new { role = m.Role, content = m.Content });
 
+        if (request.JsonOnly)
+            return new
+            {
+                model = Options.Model,
+                messages,
+                temperature = request.Temperature,
+                max_tokens = request.MaxTokens,
+                stream,
+                response_format = new { type = "json_object" }
+            };
         return new
         {
             model = Options.Model,

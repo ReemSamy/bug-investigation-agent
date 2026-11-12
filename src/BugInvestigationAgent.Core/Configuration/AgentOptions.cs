@@ -26,6 +26,8 @@ public sealed class AgentOptions
     public KmsDocsOptions KmsDocs { get; set; } = new();
 
     public SourceVersioningOptions SourceVersioning { get; set; } = new();
+
+    public LlmReproductionOptions LlmReproduction { get; set; } = new();
 }
 
 public sealed class HistoricalJiraOptions
@@ -115,6 +117,14 @@ public sealed class AgentPermissionOptions
         if (CreateLocalBranch) flags |= Permissions.AgentPermission.CreateLocalBranch;
         return flags;
     }
+}
+
+/// <summary>LLM-guided reproduction: used when an approved LLM is configured; otherwise the rule-based steps run.</summary>
+public sealed class LlmReproductionOptions
+{
+    public bool Enabled { get; set; } = true;
+    /// <summary>Upper bound of browser actions per investigation (each action is one LLM call).</summary>
+    public int MaxActions { get; set; } = 30;
 }
 
 /// <summary>How the deployed KMS version maps to a source branch, and how investigation branches are named.</summary>

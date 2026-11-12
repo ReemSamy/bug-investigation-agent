@@ -35,6 +35,22 @@ public enum ReproductionResult
     Blocked = 4
 }
 
+/// <summary>The only four Bug verdicts shown to developers.</summary>
+public enum BugVerdict
+{
+    Inconclusive = 0,
+    ConfirmedFixed = 1,
+    StillReproducible = 2,
+    Blocked = 3
+}
+
+public enum EvidenceSufficiency
+{
+    Insufficient = 0,
+    Partial = 1,
+    Sufficient = 2
+}
+
 public enum DraftReviewStatus
 {
     PendingReview = 0,
@@ -67,6 +83,21 @@ public sealed class InvestigationRecord
     public Guid? BatchId { get; set; }
 
     public InvestigationExecutionStatus ExecutionStatus { get; set; } = InvestigationExecutionStatus.Pending;
+    /// <summary>"Bug" or "Story" (from Jira, or the developer's choice).</summary>
+    public string IssueType { get; set; } = "Bug";
+    public BugVerdict Verdict { get; set; } = BugVerdict.Inconclusive;
+    public EvidenceSufficiency EvidenceSufficiency { get; set; }
+    public double? DurationSeconds { get; set; }
+    /// <summary>Developer feedback on the recommendation: "Correct", "Partially correct", "Incorrect".</summary>
+    public string? Feedback { get; set; }
+    public string? FeedbackNote { get; set; }
+    public string? FeedbackBy { get; set; }
+    public DateTimeOffset? FeedbackAt { get; set; }
+    /// <summary>Approved reopen of a Still Reproducible bug: who, when, result.</summary>
+    public string? ReopenResult { get; set; }
+    public string? ReopenedBy { get; set; }
+    public DateTimeOffset? ReopenedAt { get; set; }
+    public string? FixTaskPath { get; set; }
     public string? ExecutionDetail { get; set; }
     public BugAssessment Assessment { get; set; } = BugAssessment.Undetermined;
     /// <summary>Additional observations (e.g. "CriticalCandidate,MissingSteps") — never counted in the primary totals.</summary>

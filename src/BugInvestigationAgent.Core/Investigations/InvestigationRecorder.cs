@@ -50,6 +50,9 @@ public sealed class InvestigationRecorder : IInvestigationCompletionSink
 
         var report = InvestigationReportBuilder.Build(ctx, _redactor, ctx.RepositoryDisplay ?? ctx.WorkspacePath);
         var a = InvestigationAssessor.Assess(session.State, ctx, report, issue, DateTimeOffset.UtcNow);
+        var verdict = _redactor.Redact(InvestigationVerdict.Build(a, ctx));
+        report.Verdict = verdict;
+        report.CodeAnalysis = InvestigationVerdict.CodeAnalysisStatus(ctx);
         var reportDir = ctx.CustomFields.TryGetValue(ReportDirectoryField, out var d) ? d : null;
 
         var record = new InvestigationRecord
@@ -59,7 +62,13 @@ public sealed class InvestigationRecorder : IInvestigationCompletionSink
             IssueSummary = _redactor.Redact(ctx.Summary),
             BatchId = ctx.CustomFields.TryGetValue(BatchIdField, out var b) && Guid.TryParse(b, out var batchId) ? batchId : null,
             ExecutionStatus = a.ExecutionStatus,
-            ExecutionDetail = _redactor.Redact(a.ExecutionDetail),
+            ExecutionDetail = verdict,
+            IssueType = ctx.CustomFields.TryGetValue("issueType", out var kind) && kind == "Story" ? "Story" : "Bug",
+            Verdict = InvestigationVerdict.Classify(a, ctx),
+            EvidenceSufficiency = InvestigationVerdict.Sufficiency(InvestigationVerdict.Classify(a, ctx), ctx),
+            DurationSeconds = ctx.CustomFields.TryGetValue("startedAtUtc", out var started) && DateTimeOffset.TryParse(started, out var at)
+                ? Math.Round((DateTimeOffset.UtcNow - at).TotalSeconds, 1)
+                : null,
             Assessment = a.Assessment,
             AssessmentReason = _redactor.Redact(a.AssessmentReason),
             FlagsCsv = a.Flags.Count == 0 ? null : string.Join(",", a.Flags),
@@ -100,11 +109,32 @@ public sealed class InvestigationRecorder : IInvestigationCompletionSink
             Detail = $"{record.IssueKey}: {record.ExecutionStatus}, assessment {record.Assessment}, draft pending review."
         }, cancellationToken);
         ctx.CustomFields["investigationRecordId"] = record.Id.ToString();
-        ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Investigation record saved — Jira comment draft is PENDING REVIEW (nothing was posted to Jira).");
+        // The plain-language verdict replaces the technical outcome message in the UI, and the local report files
+        // are rewritten with it at the top (same content otherwise).
+        ctx.FinalStatusMessage = verdict;
+        ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Verdict: {verdict}");
+        ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} {report.CodeAnalysis}");
+        ctx.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Investigation saved locally (nothing was posted to Jira).");
+        TryRewriteReportFiles(record);
         session.NotifyChanged();
     }
 
     private static string? NullIfEmpty(string? s) => string.IsNullOrWhiteSpace(s) ? null : s;
+
+    private void TryRewriteReportFiles(InvestigationRecord record)
+    {
+        try
+        {
+            if (record.ReportMarkdownPath is { } md && File.Exists(md))
+                File.WriteAllText(md, record.ReportMarkdown ?? "");
+            if (record.ReportJsonPath is { } json && File.Exists(json))
+                File.WriteAllText(json, record.ReportJson ?? "");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning("Could not update the report files for {Issue}: {Error}", record.IssueKey, _redactor.Redact(ex.Message));
+        }
+    }
 }
 
 public static class InvestigationAuditActions

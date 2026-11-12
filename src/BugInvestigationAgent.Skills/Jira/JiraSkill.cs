@@ -170,6 +170,15 @@ public sealed class JiraSkill : ISkill
     {
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
+        if (root.TryGetProperty("fields", out var own))
+        {
+            if (own.TryGetProperty("status", out var s) && s.ValueKind == JsonValueKind.Object)
+                ctx.JiraStatus = GetString(s, "name");
+            if (own.TryGetProperty("resolution", out var r) && r.ValueKind == JsonValueKind.Object)
+                ctx.JiraResolution = GetString(r, "name");
+            if (DateTimeOffset.TryParse(GetString(own, "resolutiondate"), out var resolved))
+                ctx.JiraResolvedAt = resolved;
+        }
         if (root.TryGetProperty("fields", out var fields) && fields.TryGetProperty("issuelinks", out var links) && links.ValueKind == JsonValueKind.Array)
         {
             foreach (var link in links.EnumerateArray())

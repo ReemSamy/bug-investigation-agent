@@ -19,7 +19,7 @@ public static class CommentDraftBuilder
     {
         var sb = new StringBuilder();
         sb.AppendLine(Header);
-        sb.AppendLine($"Investigation of {record.IssueKey}: {InvestigationAssessor.Short(record.ExecutionDetail, 220)}");
+        sb.AppendLine($"Investigation of {record.IssueKey}: {InvestigationAssessor.Short(record.ExecutionDetail, 400)}");
         sb.AppendLine($"Assessment: {InvestigationAssessor.Label(record.Assessment)} — {InvestigationAssessor.Short(record.AssessmentReason, 220)}");
         var env = string.IsNullOrWhiteSpace(record.EnvironmentName) ? "" : $" on {record.EnvironmentName}";
         var notProof = record.ReproductionOutcome == ReproductionResult.NotReproduced ? " (not proof that the bug is fixed)" : "";

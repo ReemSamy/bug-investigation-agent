@@ -32,7 +32,7 @@
                 {
                     <tr style="border-top:1px solid var(--border);">
                         <td>@r.CreatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm")</td>
-                        <td><b>@r.IssueKey</b><div class="muted">@r.IssueSummary</div></td>
+                        <td><b>@r.IssueKey</b><div class="muted">@r.IssueSummary</div><div><b>@r.ExecutionDetail</b></div></td>
                         <td>@r.ExecutionStatus</td>
                         <td>@InvestigationAssessor.Label(r.Assessment)@(r.Flags.Count > 0 ? $" (+{string.Join(", ", r.Flags)})" : "")</td>
                         <td>@(r.KmsVersion ?? "?")</td>

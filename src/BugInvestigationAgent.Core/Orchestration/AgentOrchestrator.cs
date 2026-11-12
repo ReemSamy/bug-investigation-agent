@@ -134,6 +134,9 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         session.Context.Investigation.Clear();
         session.Context.CodeCorrelation.Clear();
         session.Context.ExpectedResult = null;
+        session.Context.JiraStatus = null;
+        session.Context.JiraResolution = null;
+        session.Context.JiraResolvedAt = null;
         session.Context.ActualResult = null;
         session.Context.LinkedIssues.Clear();
         session.Context.ResolvedLinkedIssueKeys.Clear();
@@ -158,6 +161,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         ResetEnvironmentAndAuthentication(session.Context);
         _sessionCredentials.Clear(session.Id);
         session.Context.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Starting fresh investigation for {session.Context.JiraTicketKey}.");
+        session.Context.CustomFields["startedAtUtc"] = DateTimeOffset.UtcNow.ToString("O");
         _redactor.ClearSessionSecrets(session.Id);
 
         // One cancellation source PER investigation: starting or cancelling one never affects another user's run.
@@ -543,6 +547,7 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         {
             session.MissingInfoWaiter?.TrySetResult(false);
             session.Context.StatusLog.Add($"{DateTimeOffset.UtcNow:HH:mm:ss} Run canceled (a newer ticket Analyze was started).");
+            session.Context.CustomFields["runCancelled"] = "true";
             session.NotifyChanged();
             throw;
         }
@@ -586,11 +591,9 @@ public sealed class AgentOrchestrator : IAgentOrchestrator
         }
 
         await ExecuteSkillAsync(sp, SkillIds.EvidenceReporting, session, cancellationToken);
-        ctx.FinalStatusMessage = outcomeText + (analysed
-            ? ". Code analysis added a root-cause hypothesis (not verified). Review the report."
-            : MissingInfoResolver.IsLocalWorkspace(ctx.WorkspacePath)
-                ? ". No code analysis result (LLM not configured or its call failed — see the report). Review Evidence."
-                : ". No source workspace is available, so no code analysis was done. Review Evidence.");
+        // Outcome only. The plain-language verdict (fixed / still reproducible / could not verify, and why) is written
+        // by the investigation recorder from the full evidence; code-analysis status is reported on its own line.
+        ctx.FinalStatusMessage = outcomeText + (analysed ? "; code analysis added a root-cause hypothesis (not verified)." : ".");
         session.SetState(AgentState.Completed, ctx.FinalStatusMessage);
     }
 

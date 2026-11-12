@@ -18,6 +18,8 @@ public sealed class AgentTurnRequest
     public string? SystemPrompt { get; init; }
     public double Temperature { get; init; } = 0.2;
     public int? MaxTokens { get; init; }
+    /// <summary>Ask the provider to reply with a single JSON object (OpenAI/Ollama "json_object" mode) when it supports it.</summary>
+    public bool JsonOnly { get; init; }
 }
 
 public sealed class AgentMessage

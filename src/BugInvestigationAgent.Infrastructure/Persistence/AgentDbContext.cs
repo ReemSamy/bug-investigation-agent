@@ -110,6 +110,9 @@ public sealed class AgentDbContext : DbContext
             e.Property(x => x.ReproductionOutcome).HasConversion<int>();
             e.Property(x => x.DraftStatus).HasConversion<int>();
             e.Property(x => x.PublishStatus).HasConversion<int>();
+            e.Property(x => x.Verdict).HasConversion<int>();
+            e.Property(x => x.EvidenceSufficiency).HasConversion<int>();
+            e.Property(x => x.IssueType).HasMaxLength(32);
             e.Property(x => x.Version).IsConcurrencyToken();
             e.HasIndex(x => x.IssueKey);
             e.HasIndex(x => x.InvestigationId);

@@ -20,6 +20,10 @@ public sealed class InvestigationReport
     public string? Summary { get; init; }
     /// <summary>High / Medium / Low — how strongly the evidence supports the conclusions (see <see cref="ConfidenceReason"/>).</summary>
     public string Confidence { get; init; } = "Low";
+    /// <summary>Plain-language conclusion (set once the assessment is known).</summary>
+    public string? Verdict { get; set; }
+    /// <summary>Whether code was analysed and, if not, the real reason.</summary>
+    public string? CodeAnalysis { get; set; }
     public string? ConfidenceReason { get; init; }
     public List<string> SimilarIssues { get; init; } = new();
     public string? EnvironmentId { get; init; }
@@ -171,7 +175,7 @@ public static class InvestigationReportBuilder
         }
         if (string.IsNullOrWhiteSpace(ctx.DeployedVersion))
             missing.Add("The deployed KMS version could not be identified" + (ctx.DeployedVersionSource is null ? "." : $" ({R(ctx.DeployedVersionSource)})."));
-        if (string.IsNullOrWhiteSpace(ctx.SourceVersionRef) && !string.IsNullOrWhiteSpace(ctx.SourceVersionNote))
+        if (!string.IsNullOrWhiteSpace(ctx.DeployedVersion) && string.IsNullOrWhiteSpace(ctx.SourceVersionRef) && !string.IsNullOrWhiteSpace(ctx.SourceVersionNote))
             missing.Add(R(ctx.SourceVersionNote));
         if (string.IsNullOrWhiteSpace(ctx.ExpectedResult))
             missing.Add("The ticket does not state the expected result.");
@@ -247,7 +251,11 @@ public static class InvestigationReportBuilder
     public static string ToMarkdown(InvestigationReport r)
     {
         var sb = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(r.Verdict))
+            sb.AppendLine($"## {r.IssueKey}: {r.Verdict}").AppendLine();
         sb.AppendLine($"**Investigation of {r.IssueKey}** — reproduction: **{r.ReproductionOutcome}**");
+        if (!string.IsNullOrWhiteSpace(r.CodeAnalysis))
+            sb.AppendLine().AppendLine(r.CodeAnalysis);
         sb.AppendLine();
         if (!string.IsNullOrWhiteSpace(r.Summary))
             sb.AppendLine($"Ticket: {r.Summary}").AppendLine();

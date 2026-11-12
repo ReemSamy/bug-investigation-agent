@@ -25,11 +25,11 @@ public class DatabaseMigratorTests
     public async Task Fresh_database_gets_all_versions_once_and_reruns_are_no_ops()
     {
         await using (var db = Db())
-            Assert.That(await DatabaseMigrator.MigrateAsync(db), Is.EqualTo(new[] { 1, 2, 3, 4, 5 }));
+            Assert.That(await DatabaseMigrator.MigrateAsync(db), Is.EqualTo(new[] { 1, 2, 3, 4, 5, 6 }));
         await using (var db = Db())
         {
             Assert.That(await DatabaseMigrator.MigrateAsync(db), Is.Empty);
-            Assert.That(await DatabaseMigrator.AppliedVersionsAsync(db), Is.EqualTo(new[] { 1, 2, 3, 4, 5 }));
+            Assert.That(await DatabaseMigrator.AppliedVersionsAsync(db), Is.EqualTo(new[] { 1, 2, 3, 4, 5, 6 }));
             db.InvestigationJobs.Add(new InvestigationJob { TenantId = "t", CloudId = "c", IssueId = "1", IssueKey = "A-1", InvokingAccountId = "a", ContextSnapshotJson = "{}" });
             await db.SaveChangesAsync();
         }
@@ -45,9 +45,9 @@ public class DatabaseMigratorTests
         }));
         var results = await Task.WhenAll(tasks);
 
-        Assert.That(results.SelectMany(r => r).OrderBy(v => v), Is.EqualTo(new[] { 1, 2, 3, 4, 5 }), "each version applied by exactly one starter");
+        Assert.That(results.SelectMany(r => r).OrderBy(v => v), Is.EqualTo(new[] { 1, 2, 3, 4, 5, 6 }), "each version applied by exactly one starter");
         await using var check = Db();
-        Assert.That(await DatabaseMigrator.AppliedVersionsAsync(check), Is.EqualTo(new[] { 1, 2, 3, 4, 5 }));
+        Assert.That(await DatabaseMigrator.AppliedVersionsAsync(check), Is.EqualTo(new[] { 1, 2, 3, 4, 5, 6 }));
     }
 
     [Test]

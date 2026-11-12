@@ -45,7 +45,9 @@ public static class InvestigationAssessor
                 (InvestigationExecutionStatus.Completed, ctx.FinalStatusMessage ?? "Completed."),
             AgentState.Completed =>
                 (InvestigationExecutionStatus.Inconclusive, (ctx.FinalStatusMessage ?? "Completed") + " — no reproduction evidence and no code-analysis result."),
-            _ => (InvestigationExecutionStatus.Blocked, $"The run ended before completion (state: {finalState}).")
+            _ when ctx.CustomFields.ContainsKey("runCancelled") =>
+                (InvestigationExecutionStatus.Blocked, $"the run was cancelled while {StepName(finalState)} because Analyze was clicked again. Run it again and let it finish."),
+            _ => (InvestigationExecutionStatus.Blocked, $"the run stopped before it finished (while {StepName(finalState)}).")
         };
 
         var reproduction = ctx.ReproductionOutcome switch
@@ -72,10 +74,13 @@ public static class InvestigationAssessor
                                 (!ctx.CustomFields.TryGetValue("manualStepsRemaining", out var manual) || manual == "0") &&
                                 (!ctx.CustomFields.TryGetValue("failedNavSteps", out var failedNav) || failedNav == "0");
         var confirmedFixed = ctx.ReproductionOutcome == ReproductionOutcome.NotReproduced && allStepsAutomated && ctx.FixCommitsInVersion.Count > 0;
+        // The ticket itself says it was solved (status/resolution), optionally with a fix version already deployed.
+        var resolvedTicket = IsResolved(ctx);
         var possiblyFixed = !reproduced && !confirmedFixed &&
-                            (!string.IsNullOrWhiteSpace(ctx.FixPullRequestUrl) || fixedRelated.Count > 0 ||
+                            (resolvedTicket || !string.IsNullOrWhiteSpace(ctx.FixPullRequestUrl) || fixedRelated.Count > 0 ||
                              ctx.FixCommitsInVersion.Count > 0 || ctx.ResolvedLinkedIssueKeys.Count > 0);
-        var missingInfo = !ctx.CustomFields.ContainsKey("stepsFromJira") && (ctx.Description ?? "").Trim().Length < 80;
+        var missingInfo = ctx.CustomFields.ContainsKey("insufficientInformation") ||
+                          (!ctx.CustomFields.ContainsKey("stepsFromJira") && (ctx.Description ?? "").Trim().Length < 80);
         var priority = issue?.Priority ?? (ctx.CustomFields.TryGetValue("priority", out var p) ? p : null);
         var critical = HighPriorities.Contains(priority ?? "", StringComparer.OrdinalIgnoreCase) ||
                        HighImpactWording.IsMatch($"{ctx.Summary}\n{ctx.Description}");
@@ -89,7 +94,9 @@ public static class InvestigationAssessor
                 $"All reproduction steps ran without showing the defect on KMS {ctx.DeployedVersion}, and {ctx.SourceVersionRef} contains: {string.Join("; ", ctx.FixCommitsInVersion.Take(2))}."),
             (BugAssessment.PotentialDuplicate, duplicates.Count > 0, $"Closely matches {string.Join(", ", duplicates)}."),
             (BugAssessment.PossiblyFixed, possiblyFixed,
-                !string.IsNullOrWhiteSpace(ctx.FixPullRequestUrl)
+                resolvedTicket
+                    ? ResolvedTicketReason(ctx) + " The bug was not reproduced."
+                    : !string.IsNullOrWhiteSpace(ctx.FixPullRequestUrl)
                     ? $"The ticket links a fix ({ctx.FixPullRequestUrl}) and the bug was not reproduced."
                     : ctx.FixCommitsInVersion.Count > 0
                         ? $"{ctx.SourceVersionRef} contains a commit mentioning the ticket, but reproduction did not fully confirm the fix."
@@ -153,6 +160,64 @@ public static class InvestigationAssessor
 
     private static string? LastLog(RuntimeContext ctx) => ctx.StatusLog.SafeSnapshot().LastOrDefault();
 
+    public static bool IsResolved(RuntimeContext ctx) =>
+        !string.IsNullOrWhiteSpace(ctx.JiraResolution) || DoneStatuses.Contains(ctx.JiraStatus ?? "", StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>"The ticket is resolved (Done, fixed in 14.0.0 — included in the deployed KMS 14.1.0)."</summary>
+    public static string ResolvedTicketReason(RuntimeContext ctx)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(ctx.JiraStatus)) parts.Add(ctx.JiraStatus!);
+        if (!string.IsNullOrWhiteSpace(ctx.JiraResolution) && !string.Equals(ctx.JiraResolution, ctx.JiraStatus, StringComparison.OrdinalIgnoreCase)) parts.Add(ctx.JiraResolution!);
+        if (ctx.JiraResolvedAt is { } at) parts.Add($"on {at:yyyy-MM-dd}");
+        var text = $"The ticket is resolved ({string.Join(", ", parts)})";
+        if (!string.IsNullOrWhiteSpace(ctx.FixVersion))
+        {
+            var included = FixVersionIncluded(ctx.FixVersion, ctx.DeployedVersion);
+            text += included switch
+            {
+                true => $"; its fix version {ctx.FixVersion} is included in the deployed KMS {ctx.DeployedVersion}",
+                false => $"; its fix version {ctx.FixVersion} is NEWER than the deployed KMS {ctx.DeployedVersion}, so the fix may not be deployed there",
+                null => $"; fix version {ctx.FixVersion} (deployed version unknown)"
+            };
+        }
+        return text + ".";
+    }
+
+    /// <summary>True when every listed fix version is ≤ the deployed version; null when either is unknown/unparseable.</summary>
+    public static bool? FixVersionIncluded(string? fixVersions, string? deployedVersion)
+    {
+        var deployed = ParseVersion(deployedVersion);
+        var fixes = (fixVersions ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(ParseVersion).Where(v => v is not null).ToList();
+        if (deployed is null || fixes.Count == 0)
+            return null;
+        return fixes.Min(v => Compare(v!, deployed)) <= 0;
+    }
+
+    private static int[]? ParseVersion(string? text)
+    {
+        var m = Regex.Match(text ?? "", @"\d+(?:\.\d+){0,3}");
+        return m.Success ? m.Value.Split('.').Select(int.Parse).ToArray() : null;
+    }
+
+    private static int Compare(int[] a, int[] b)
+    {
+        for (var i = 0; i < Math.Max(a.Length, b.Length); i++)
+        {
+            var c = (i < a.Length ? a[i] : 0).CompareTo(i < b.Length ? b[i] : 0);
+            if (c != 0)
+                return c;
+        }
+        return 0;
+    }
+
     internal static string Short(string? s, int max) =>
         string.IsNullOrWhiteSpace(s) ? "" : s.Length <= max ? s.Trim() : s[..(max - 1)].Trim() + "…";
+    private static string StepName(BugInvestigationAgent.Core.Workflow.AgentState state) => state switch
+    {
+        BugInvestigationAgent.Core.Workflow.AgentState.Investigating => "analysing the code",
+        BugInvestigationAgent.Core.Workflow.AgentState.Reproducing => "reproducing the bug",
+        _ => state.ToString()
+    };
 }

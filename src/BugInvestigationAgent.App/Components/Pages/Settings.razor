@@ -127,8 +127,12 @@
     </div>
     <div class="btn-row">
         <button class="btn secondary" @onclick="SaveAiOnly">Save AI settings</button>
-        <button class="btn secondary" disabled="@_busy" @onclick="TestLlmAsync">Test LLM connection</button>
+        <button class="btn secondary" disabled="@_busy" @onclick="TestLlmAsync">@(_llmTesting ? "Testing… (up to a minute)" : "Test LLM connection")</button>
     </div>
+    @if (!string.IsNullOrWhiteSpace(_llmTestResult))
+    {
+        <div class="banner @(_llmTestOk ? "success" : "warn")" style="margin-top:0.5rem">@_llmTestResult</div>
+    }
     @if (!string.IsNullOrWhiteSpace(RuntimeResolver.LlmUnavailableReason))
     {
         <div class="banner warn" style="margin-top:0.5rem">Investigations currently run WITHOUT the LLM: @RuntimeResolver.LlmUnavailableReason</div>
@@ -170,6 +174,8 @@
     private IReadOnlyList<DiagnosticResult> _checks = Array.Empty<DiagnosticResult>();
     private string _message = "";
     private bool _messageOk;
+    private bool _llmTesting, _llmTestOk;
+    private string _llmTestResult = "";
     private bool _busy;
     private string _sampleIssue = "VKMS-4180";
 
@@ -262,12 +268,19 @@
         _busy = true;
         try
         {
+            (_llmTesting, _llmTestResult) = (true, "");
+            StateHasChanged();
             var r = await Diagnostics.TestLlmAsync();
-            (_messageOk, _message) = (r.Ok, "LLM connection test: " + r.Detail);
+            (_llmTestOk, _llmTestResult) = (r.Ok, "LLM connection test: " + r.Detail);
+        }
+        catch (Exception ex)
+        {
+            (_llmTestOk, _llmTestResult) = (false, "LLM connection test failed: " + ex.Message);
         }
         finally
         {
             _busy = false;
+            _llmTesting = false;
         }
     }
 

@@ -104,6 +104,16 @@ public static class DatabaseMigrator
         {
             foreach (var column in new[] { "KmsVersion", "SourceBranch", "CreatedBranch", "BranchNote", "ProposedFix", "AffectedFilesCsv" })
                 await m.AddColumnIfMissingAsync("InvestigationRecords", column, "TEXT NULL", "text NULL", ct);
+        }),
+        // 6: Bug/Story, the four Bug verdicts, evaluation (duration, evidence, developer feedback), reopen audit, fix task.
+        new(6, "verdict-evaluation-feedback", async (m, ct) =>
+        {
+            await m.AddColumnIfMissingAsync("InvestigationRecords", "IssueType", "TEXT NOT NULL DEFAULT 'Bug'", "varchar(32) NOT NULL DEFAULT 'Bug'", ct);
+            await m.AddColumnIfMissingAsync("InvestigationRecords", "Verdict", "INTEGER NOT NULL DEFAULT 0", "integer NOT NULL DEFAULT 0", ct);
+            await m.AddColumnIfMissingAsync("InvestigationRecords", "EvidenceSufficiency", "INTEGER NOT NULL DEFAULT 0", "integer NOT NULL DEFAULT 0", ct);
+            await m.AddColumnIfMissingAsync("InvestigationRecords", "DurationSeconds", "REAL NULL", "double precision NULL", ct);
+            foreach (var column in new[] { "Feedback", "FeedbackNote", "FeedbackBy", "FeedbackAt", "ReopenResult", "ReopenedBy", "ReopenedAt", "FixTaskPath" })
+                await m.AddColumnIfMissingAsync("InvestigationRecords", column, "TEXT NULL", "text NULL", ct);
         })
     ];
 

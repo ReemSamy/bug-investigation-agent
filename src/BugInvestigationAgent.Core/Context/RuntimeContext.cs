@@ -41,6 +41,10 @@ public sealed class RuntimeContext
     public string? RepositoryDisplay { get; set; }
 
     // ── Ticket detail (read from Jira, never written back) ──
+    /// <summary>The ticket's own Jira status (e.g. "Done") and resolution (e.g. "Fixed"), when read.</summary>
+    public string? JiraStatus { get; set; }
+    public string? JiraResolution { get; set; }
+    public DateTimeOffset? JiraResolvedAt { get; set; }
     public string? ExpectedResult { get; set; }
     public string? ActualResult { get; set; }
     /// <summary>"relates to VKMS-12 (Done): summary" — Jira issue links.</summary>

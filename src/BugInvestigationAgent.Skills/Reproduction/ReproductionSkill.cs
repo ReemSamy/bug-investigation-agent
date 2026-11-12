@@ -20,17 +20,20 @@ public sealed class ReproductionSkill : ISkill
     private readonly ISecretRedactor _redactor;
     private readonly IPlaywrightSessionHub _sessions;
     private readonly IEnvironmentSelectionService? _environments;
+    private readonly BugInvestigationAgent.Core.Orchestration.IAgentRuntimeResolver? _llm;
 
     public ReproductionSkill(
         IOptions<AgentOptions> options,
         ISecretRedactor redactor,
         IPlaywrightSessionHub sessions,
-        IEnvironmentSelectionService? environments = null)
+        IEnvironmentSelectionService? environments = null,
+        BugInvestigationAgent.Core.Orchestration.IAgentRuntimeResolver? llm = null)
     {
         _options = options.Value;
         _redactor = redactor;
         _sessions = sessions;
         _environments = environments;
+        _llm = llm;
     }
 
     public string SkillId => SkillIds.Reproduction;
@@ -90,6 +93,13 @@ public sealed class ReproductionSkill : ISkill
 
             page.SetDefaultTimeout(_options.Browser.ActionTimeoutMs);
             page.SetDefaultNavigationTimeout(_options.Browser.NavigationTimeoutMs);
+
+            // With an approved LLM, the LLM follows the ticket's own steps in the browser (rule-based steps otherwise).
+            var runtime = _llm?.GetCurrent();
+            if (!isRetest && _options.LlmReproduction.Enabled && runtime is not null && Common.LlmHelpers.IsUsableLlm(runtime))
+                return await RunLlmGuidedAsync(page, ctx, runtime, login, request.Progress, cancellationToken);
+            if (_options.LlmReproduction.Enabled && _llm?.LlmUnavailableReason is { } why)
+                request.Progress?.Report("Rule-based step following (LLM-guided reproduction is off: " + why + ")");
 
             var steps = TicketStepPlanner.ResolveSteps(ctx);
             request.Progress?.Report(
@@ -426,6 +436,33 @@ public sealed class ReproductionSkill : ISkill
         catch (TimeoutException)
         {
         }
+    }
+
+    private async Task<SkillResult> RunLlmGuidedAsync(IPage page, RuntimeContext ctx, BugInvestigationAgent.Core.Abstractions.IAgentRuntime runtime,
+        LoginFormOptions? login, IProgress<string>? progress, CancellationToken cancellationToken)
+    {
+        // The ticket's own words (not the rule-based rewrite).
+        var ticketSteps = BugInvestigationAgent.Skills.Jira.JiraSkill.ExtractSteps(ctx.Description);
+        if (ticketSteps.Count == 0)
+            ticketSteps = ctx.ReproductionSteps.ToList();
+        ctx.ReproductionSteps = ticketSteps;
+
+        await BrowserWaits.WaitForPageReadyAsync(page, _options.Browser);
+        var driver = new LlmReproductionDriver(runtime, _options, _redactor);
+        var env = _environments?.ResolveSelected(ctx);
+        var outcome = await driver.RunAsync(page, ctx, env, ticketSteps, login, progress, cancellationToken);
+
+        ctx.ReproductionOutcome = outcome.Result;
+        ctx.ReproductionNotes = outcome.Conclusion;
+        ctx.CustomFields["llmReproduction"] = "true";
+        ctx.CustomFields["reproductionActions"] = outcome.Actions.ToString();
+        ctx.CustomFields["reproductionConclusion"] = outcome.Conclusion;
+        if (outcome.NeedsPerson)
+            ctx.CustomFields["manualStepsRemaining"] = "1";
+        if (outcome.InsufficientInformation)
+            ctx.CustomFields["insufficientInformation"] = "true";
+        progress?.Report($"Reproduction result: {outcome.Result} — {outcome.Conclusion}");
+        return SkillResult.Ok(outcome.Conclusion);
     }
 
     private static bool RequiresPageChange(string step) =>

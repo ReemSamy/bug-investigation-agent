@@ -443,6 +443,8 @@ public class LocalEndToEndAndReadOnlyTests
         Assert.That(h.Repo.Branches(), Is.EqualTo(branchesBefore));
         var report = BugInvestigationAgent.Core.Reporting.InvestigationReport.FromJson(record.ReportJson)!;
         Assert.That(report.MissingForVerification, Has.Some.Contains("version could not be identified"));
+        Assert.That(report.MissingForVerification.Count(m => m.Contains("version", StringComparison.OrdinalIgnoreCase)), Is.EqualTo(1), "reported once");
+        Assert.That(record.ExecutionDetail ?? "", Does.Not.Contain("LLM not configured"), "the real reason is the unknown version");
     }
 
     [TestCase("12.28.4", "Release-12.28.4")]
@@ -489,7 +491,7 @@ public class LocalEndToEndAndReadOnlyTests
     {
         var ctx = new RuntimeContext();
         BugInvestigationAgent.Skills.Jira.JiraSkill.ParseLinksAndHistory(ctx, """
-            {"key":"VKMS-2601","fields":{"issuelinks":[
+            {"key":"VKMS-2601","fields":{"status":{"name":"Done"},"resolution":{"name":"Fixed"},"resolutiondate":"2026-09-17T10:00:00.000+0000","issuelinks":[
               {"type":{"outward":"relates to","inward":"is related to"},"outwardIssue":{"key":"VKMS-2600","fields":{"summary":"Pre-MOC dates","status":{"name":"Done"}}}},
               {"type":{"outward":"blocks","inward":"is blocked by"},"inwardIssue":{"key":"VKMS-10","fields":{"summary":"Other","status":{"name":"Backlog"}}}}]},
              "changelog":{"histories":[{"created":"2026-02-24T10:00:00.000+0000","author":{"displayName":"Reem"},
@@ -498,6 +500,9 @@ public class LocalEndToEndAndReadOnlyTests
         Assert.That(ctx.LinkedIssues, Is.EqualTo(new[] { "relates to VKMS-2600 (Done): Pre-MOC dates", "is blocked by VKMS-10 (Backlog): Other" }));
         Assert.That(ctx.ResolvedLinkedIssueKeys, Is.EqualTo(new[] { "VKMS-2600" }));
         Assert.That(ctx.IssueHistory, Is.EqualTo(new[] { "2026-02-24 Reem: status To Do → Backlog" }));
+        Assert.That(ctx.JiraStatus, Is.EqualTo("Done"));
+        Assert.That(ctx.JiraResolution, Is.EqualTo("Fixed"));
+        Assert.That(ctx.JiraResolvedAt?.Year, Is.EqualTo(2026));
 
         var (expected, actual) = BugInvestigationAgent.Skills.Jira.JiraSkill.ExtractExpectedActual(
             "Steps to reproduce:\n1. Open Pre-MOC\nExpected result: The date is displayed.\nActual result: The date is empty.\nEnvironment: QA");
@@ -505,6 +510,8 @@ public class LocalEndToEndAndReadOnlyTests
         Assert.That(actual, Is.EqualTo("The date is empty."));
     }
 
+    // kms14-portal About dialog (2026-11-11): the build number carries the exact release; "KMS Version: 14.0" is rounded.
+    [TestCase("KMS Version: 14.0\nBuild Number: kms14-suite-release-v14.1.0-20261110.3\nDatabase Name: KMSv12_RC", null, "14.1.0")]
     [TestCase("KMS Version 12.28.4 © 2026", null, "12.28.4")]
     [TestCase("Build v14.2.0.117", null, "14.2.0.117")]
     [TestCase("Updated 2026-03-04, 10 items", null, null)]

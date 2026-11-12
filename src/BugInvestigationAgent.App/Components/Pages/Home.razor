@@ -75,14 +75,14 @@
         {
             <div class="banner warn">
                 Account saved but not verified.
-                Open <a href="/settings">Sign in / Account</a> and click <strong>Sign in with my account</strong>.
+                Open <a href="/settings">Settings</a> and click <strong>Sign in with my account</strong>.
             </div>
         }
         else
         {
             <div class="banner warn">
                 <strong>Not signed in.</strong>
-                Open <a href="/settings">Sign in / Account</a> and sign in with your Atlassian email + API token.
+                Open <a href="/settings">Settings</a> and sign in with your Atlassian email + API token.
             </div>
         }
 
@@ -92,7 +92,7 @@
         </div>
         <div class="btn-row">
             <button class="btn" disabled="@(_busy || !JiraConnection.IsSignedIn)" @onclick="StartAsync">Analyze ticket</button>
-            <a class="btn secondary" href="/settings">Sign in / Account</a>
+            <a class="btn secondary" href="/settings">Settings</a>
         </div>
 
         @if (_session is not null)
@@ -213,7 +213,7 @@
                         }
                         else if (field.InputType == "settings-link" || field.Key == "jiraSettings")
                         {
-                            <a class="btn" href="/settings">Open Sign in / Account</a>
+                            <a class="btn" href="/settings">Open Settings</a>
                         }
                         else if (field.InputType == "textarea" || field.Key == "ticketText" || field.Key == "reproductionSteps")
                         {
